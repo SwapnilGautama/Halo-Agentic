@@ -5,6 +5,7 @@ duckdb-engine==0.13.6
 langchain
 langchain-community
 langchain-openai
+langgraph
 sqlalchemy==2.0.35
-openpyxl
 plotly
+openpyxl
