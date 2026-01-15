@@ -1,6 +1,7 @@
 streamlit
 pandas
 duckdb
+duckdb-engine
 langchain
 langchain-community
 langchain-openai
