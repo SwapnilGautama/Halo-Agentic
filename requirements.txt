@@ -1,8 +1,0 @@
-streamlit
-pandas
-duckdb
-langchain
-langchain-community
-langchain-openai
-python-dotenv
-sqlalchemy
