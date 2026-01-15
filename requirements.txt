@@ -7,3 +7,4 @@ langchain-community
 langchain-openai
 sqlalchemy==2.0.35
 openpyxl
+plotly
