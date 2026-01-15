@@ -14,29 +14,30 @@ st.title("🤖 L&T Financial Analyst AI")
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 else:
-    st.error("Missing OPENAI_API_KEY in Streamlit Secrets!")
+    st.error("Missing OPENAI_API_KEY in Secrets!")
     st.stop()
 
-# 2. Database Initialization
+# 2. In-Memory Database Initialization (Best for Cloud)
 @st.cache_resource
 def init_db():
-    db_name = "lnt_analytics.db"
+    # Create an in-memory connection
+    con = duckdb.connect(database=':memory:')
     
-    # Standard duckdb library connection to load data
-    con = duckdb.connect(db_name)
+    # Load each file if it exists in your repo
+    files = {
+        "pnl_data": "pnl_data.xlsx",
+        "ut_data": "ut_data.xlsx"
+    }
     
-    if os.path.exists("pnl_data.xlsx"):
-        df_pnl = pd.read_excel("pnl_data.xlsx", engine="openpyxl")
-        con.execute("CREATE OR REPLACE TABLE pnl_data AS SELECT * FROM df_pnl")
+    for table_name, file_path in files.items():
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path, engine="openpyxl")
+            con.register('df_temp', df)
+            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df_temp")
+            con.unregister('df_temp')
     
-    if os.path.exists("ut_data.xlsx"):
-        df_ut = pd.read_excel("ut_data.xlsx", engine="openpyxl")
-        con.execute("CREATE OR REPLACE TABLE ut_data AS SELECT * FROM df_ut")
-    
-    con.close() # CRITICAL: Close this connection so SQLAlchemy can take over
-    
-    # URI for LangChain/SQLAlchemy
-    return SQLDatabase.from_uri(f"duckdb:///{db_name}")
+    # Return a LangChain SQLDatabase pointing to this in-memory session
+    return SQLDatabase.from_uri("duckdb:///:memory:")
 
 @st.cache_data
 def get_kpi_context():
@@ -45,6 +46,7 @@ def get_kpi_context():
         return df_kpi.to_string()
     return "No KPI directory found."
 
+# Initialize Resources
 db = init_db()
 kpi_context = get_kpi_context()
 
@@ -66,7 +68,7 @@ agent_executor = create_sql_agent(
     extra_prompt_messages=[("system", system_message)]
 )
 
-# 4. Chat UI
+# 4. Chat Interface
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -80,7 +82,7 @@ if prompt := st.chat_input("Ask about FMCG Revenue or Utilization..."):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Processing..."):
+        with st.spinner("Analyzing..."):
             try:
                 response = agent_executor.invoke({"input": prompt})
                 st.markdown(response["output"])
