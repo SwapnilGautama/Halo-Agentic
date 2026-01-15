@@ -11,21 +11,24 @@ import os
 st.set_page_config(page_title="L&T Financial AI Agent", layout="wide")
 st.title("🤖 L&T Financial Analyst AI")
 
-# 1. Securely load OpenAI Key from Streamlit Secrets
+# 1. Load OpenAI Key from Streamlit Secrets
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 else:
-    st.error("Missing OpenAI API Key! Please add 'OPENAI_API_KEY' to your Streamlit Secrets.")
+    st.error("Missing OPENAI_API_KEY in Secrets!")
     st.stop()
 
 # 2. Initialize Database from Excel files
 @st.cache_resource
 def init_db():
-    con = duckdb.connect("lnt_analytics.db")
+    # Use a persistent file
+    db_file = "lnt_analytics.db"
+    con = duckdb.connect(db_file)
     
     # Load P&L Data
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx", engine="openpyxl")
+        # Explicitly create/replace table
         con.execute("CREATE OR REPLACE TABLE pnl_data AS SELECT * FROM df_pnl")
     
     # Load Utilization Data
@@ -33,8 +36,10 @@ def init_db():
         df_ut = pd.read_excel("ut_data.xlsx", engine="openpyxl")
         con.execute("CREATE OR REPLACE TABLE ut_data AS SELECT * FROM df_ut")
     
-    # Use the explicit duckdb+duckdb dialect for SQLAlchemy
-    return SQLDatabase.from_uri("duckdb+duckdb:///lnt_analytics.db")
+    con.close() # Close to release file lock for SQLAlchemy
+    
+    # Use standard DuckDB URI format
+    return SQLDatabase.from_uri(f"duckdb:///{db_file}")
 
 # 3. Load KPI Context
 @st.cache_data
@@ -44,7 +49,7 @@ def get_kpi_context():
         return df_kpi.to_string()
     return "No KPI directory found."
 
-# Setup Resources
+# Resources
 db = init_db()
 kpi_context = get_kpi_context()
 
@@ -54,14 +59,8 @@ toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
 system_message = f"""
 You are a senior L&T Financial Analyst. Use the 'pnl_data' and 'ut_data' tables.
-
-KPI RULES & DEFINITIONS:
-{kpi_context}
-
-IMPORTANT: 
-- Use 'Amount in USD' for revenue/cost queries unless the user asks for INR.
-- For FMCG queries, filter the segment columns in pnl_data.
-- For headcount/utilization, use ut_data.
+KPI RULES: {kpi_context}
+Always use 'Amount in USD' for revenue unless INR is specified.
 """
 
 agent_executor = create_sql_agent(
@@ -80,17 +79,16 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("Ask: What was the total FMCG Revenue?"):
+if prompt := st.chat_input("Ask: What was the FMCG Revenue in Q3?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing financial records..."):
+        with st.spinner("Analyzing financial data..."):
             try:
                 response = agent_executor.invoke({"input": prompt})
-                answer = response["output"]
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.markdown(response["output"])
+                st.session_state.messages.append({"role": "assistant", "content": response["output"]})
             except Exception as e:
-                st.error(f"Agent Error: {e}")
+                st.error(f"Error: {e}")
