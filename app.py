@@ -14,30 +14,32 @@ st.title("🤖 L&T Financial Analyst AI")
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 else:
-    st.error("Missing OPENAI_API_KEY in Secrets!")
+    st.error("Please add OPENAI_API_KEY to Streamlit Secrets.")
     st.stop()
 
-# 2. In-Memory Database Initialization (Best for Cloud)
+# 2. Database Initialization (Using a simple path to avoid reflection errors)
 @st.cache_resource
 def init_db():
-    # Create an in-memory connection
-    con = duckdb.connect(database=':memory:')
+    db_file = "lnt_data.db"
+    # Clean up old DB file if it exists to start fresh
+    if os.path.exists(db_file):
+        os.remove(db_file)
+        
+    con = duckdb.connect(db_file)
     
-    # Load each file if it exists in your repo
-    files = {
-        "pnl_data": "pnl_data.xlsx",
-        "ut_data": "ut_data.xlsx"
-    }
+    # Load Data
+    if os.path.exists("pnl_data.xlsx"):
+        df_pnl = pd.read_excel("pnl_data.xlsx", engine="openpyxl")
+        con.execute("CREATE TABLE pnl_data AS SELECT * FROM df_pnl")
+        
+    if os.path.exists("ut_data.xlsx"):
+        df_ut = pd.read_excel("ut_data.xlsx", engine="openpyxl")
+        con.execute("CREATE TABLE ut_data AS SELECT * FROM df_ut")
     
-    for table_name, file_path in files.items():
-        if os.path.exists(file_path):
-            df = pd.read_excel(file_path, engine="openpyxl")
-            con.register('df_temp', df)
-            con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df_temp")
-            con.unregister('df_temp')
+    con.close()
     
-    # Return a LangChain SQLDatabase pointing to this in-memory session
-    return SQLDatabase.from_uri("duckdb:///:memory:")
+    # We add 'view_support=False' to simplify the reflection process
+    return SQLDatabase.from_uri(f"duckdb:///{db_file}", view_support=False)
 
 @st.cache_data
 def get_kpi_context():
@@ -46,9 +48,13 @@ def get_kpi_context():
         return df_kpi.to_string()
     return "No KPI directory found."
 
-# Initialize Resources
-db = init_db()
-kpi_context = get_kpi_context()
+# Initialize
+try:
+    db = init_db()
+    kpi_context = get_kpi_context()
+except Exception as e:
+    st.error(f"Critical Database Error: {e}")
+    st.stop()
 
 # 3. Agent Setup
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -57,7 +63,6 @@ toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 system_message = f"""
 You are a senior L&T Financial Analyst. Use 'pnl_data' and 'ut_data' tables.
 KPI RULES: {kpi_context}
-Always use 'Amount in USD' for revenue unless INR is specified.
 """
 
 agent_executor = create_sql_agent(
@@ -76,7 +81,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("Ask about FMCG Revenue or Utilization..."):
+if prompt := st.chat_input("Ask: What is the total FMCG Revenue?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
