@@ -3,26 +3,26 @@ import pandas as pd
 import duckdb
 import plotly.express as px
 import os
+from typing import TypedDict, Annotated, List, Union
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain.agents import create_sql_agent
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Annotated, List
-import operator
 
-# --- SETUP & DATABASE ---
-st.set_page_config(page_title="L&T Multi-Agent Analyst", layout="wide")
-st.title("🏛️ L&T Multi-Agent Financial System")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="L&T Financial Multi-Agent", layout="wide")
+st.title("🏛️ L&T AI Analyst: Multi-Agent System")
 
+# 1. API KEY SETUP
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 else:
-    st.error("Missing API Key in Secrets.")
+    st.error("Add OPENAI_API_KEY to Secrets.")
     st.stop()
 
+# 2. DATABASE INIT
 @st.cache_resource
-def get_db():
+def init_db():
     db_file = "lnt_data.db"
     con = duckdb.connect(db_file)
     for f in ["pnl_data.xlsx", "ut_data.xlsx"]:
@@ -33,74 +33,75 @@ def get_db():
     con.close()
     return SQLDatabase.from_uri(f"duckdb:///{db_file}", view_support=False)
 
-db = get_db()
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+db = init_db()
+llm = ChatOpenAI(model="gpt-4o", temperature=0) # Deterministic for accuracy
 
-# --- SPECIALIZED TOOLS ---
-# Tool 1: The Data Analyst (SQL Specialist)
-sql_toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-sql_agent = create_sql_agent(llm=llm, toolkit=sql_toolkit, agent_type="openai-tools", verbose=True)
-
-# --- MULTI-AGENT STATE DEFINITION ---
+# --- MULTI-AGENT STATE ---
 class AgentState(TypedDict):
-    input: str
-    data_context: str
-    messages: Annotated[List[str], operator.add]
-    final_output: str
+    question: str
+    sql_query: str
+    raw_data: Union[pd.DataFrame, str]
+    review_status: str # "Approved" or "Fix Needed"
+    final_narrative: str
 
 # --- AGENT NODES ---
+
 def analyst_node(state: AgentState):
-    """The Analyst Agent: Fetches raw data with high precision."""
-    query = f"Provide a detailed data summary for: {state['input']}"
-    result = sql_agent.invoke({"input": query})
-    return {"data_context": result["output"], "messages": ["Analyst: Data retrieved successfully."]}
+    """Analyst: Generates the SQL query based on schema."""
+    # Simplified prompt for demonstration; in production, use a full SQL chain
+    prompt = f"Given the tables pnl_data and ut_data, write a SQL query to answer: {state['question']}. Return ONLY the SQL query code."
+    response = llm.invoke(prompt)
+    return {"sql_query": response.content.replace("```sql", "").replace("```", "").strip()}
+
+def reviewer_node(state: AgentState):
+    """Reviewer: Validates SQL logic and checks for hallucinations."""
+    validation_prompt = f"Review this SQL: {state['sql_query']} for the question: {state['question']}. Does it use correct columns? Answer 'Approved' or 'Fix Needed'."
+    check = llm.invoke(validation_prompt)
+    
+    if "Approved" in check.content:
+        # If approved, execute the query
+        try:
+            con = duckdb.connect("lnt_data.db")
+            data = con.execute(state['sql_query']).df()
+            con.close()
+            return {"raw_data": data, "review_status": "Approved"}
+        except Exception as e:
+            return {"review_status": "Fix Needed", "final_narrative": f"Execution Error: {str(e)}"}
+    return {"review_status": "Fix Needed"}
 
 def visualizer_node(state: AgentState):
-    """The Visualizer Agent: Creates Plotly charts based on Analyst's data."""
-    # Logic to decide if a chart is needed
-    if "trend" in state['input'].lower() or "compare" in state['input'].lower() or "plot" in state['input'].lower():
-        st.info("Visualizer is generating a chart...")
-        # (Internal logic here normally uses PythonREPL, for simplicity we call a direct Plotly function)
-        return {"messages": ["Visualizer: Chart generated."]}
-    return {"messages": ["Visualizer: No chart required."]}
+    """Visualizer: Creates Narrative and Plotly charts."""
+    if state["review_status"] == "Approved":
+        narrative = llm.invoke(f"Summarize this data for a CFO: {state['raw_data'].to_string()}").content
+        return {"final_narrative": narrative}
+    return {"final_narrative": "The Reviewer rejected the query logic. Please try rephrasing."}
 
-# --- LANGGRAPH ORCHESTRATION ---
+# --- GRAPH ORCHESTRATION ---
 workflow = StateGraph(AgentState)
 workflow.add_node("analyst", analyst_node)
+workflow.add_node("reviewer", reviewer_node)
 workflow.add_node("visualizer", visualizer_node)
 
 workflow.set_entry_point("analyst")
-workflow.add_edge("analyst", "visualizer")
+workflow.add_edge("analyst", "reviewer")
+workflow.add_edge("reviewer", "visualizer")
 workflow.add_edge("visualizer", END)
 
 app = workflow.compile()
 
-# --- STREAMLIT UI ---
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-if prompt := st.chat_input("Ask: Plot a 3-month trend for FMCG Revenue"):
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    
-    with st.spinner("Multi-Agent team is working..."):
-        # Run the Multi-Agent Graph
-        final_state = app.invoke({"input": prompt, "messages": []})
+# --- CHAT UI ---
+if prompt := st.chat_input("Ask about FMCG Revenue Trend..."):
+    with st.spinner("Multi-Agent Team (Analyst -> Reviewer -> Visualizer) at work..."):
+        result = app.invoke({"question": prompt})
         
-        # Display Narrative Result
-        ans = final_state["data_context"]
-        st.session_state.chat_history.append({"role": "assistant", "content": ans})
+        st.subheader("Analysis Results")
+        st.write(result["final_narrative"])
         
-        # Trigger Visualization directly if requested
-        if "plot" in prompt.lower() or "trend" in prompt.lower():
-            con = duckdb.connect("lnt_data.db")
-            # Dynamic chart based on prompt keywords
-            if "pnl" in prompt.lower() or "revenue" in prompt.lower():
-                df = con.execute("SELECT Month, SUM(\"Amount in USD\") as Total FROM pnl_data GROUP BY Month ORDER BY Month").df()
-                fig = px.bar(df, x="Month", y="Total", title="L&T Financial Trend", template="plotly_dark")
+        if result["review_status"] == "Approved":
+            df = result["raw_data"]
+            st.dataframe(df)
+            
+            # Simple Chart Logic
+            if len(df.columns) >= 2:
+                fig = px.bar(df, x=df.columns[0], y=df.columns[1], title="Automated Visualization", template="plotly_white")
                 st.plotly_chart(fig, use_container_width=True)
-            con.close()
-
-# Render Chat
-for m in st.session_state.chat_history:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
