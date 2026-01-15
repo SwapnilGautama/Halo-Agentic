@@ -1,96 +1,94 @@
 import streamlit as st
 import pandas as pd
 import duckdb
+import plotly.express as px
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import create_sql_agent
 from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
 from langchain_openai import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import os
 
-st.set_page_config(page_title="L&T Financial AI Agent", layout="wide")
-st.title("🤖 L&T Financial Analyst AI")
+st.set_page_config(page_title="L&T AI Financial Analyst", layout="wide")
+st.title("🤖 L&T Financial Analyst (Charts + Memory)")
 
-# 1. API Key from Secrets
+# 1. API Key & DB Setup
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 else:
-    st.error("Please add OPENAI_API_KEY to Streamlit Secrets.")
+    st.error("Please add OPENAI_API_KEY to Secrets.")
     st.stop()
 
-# 2. Database Initialization (Using a simple path to avoid reflection errors)
 @st.cache_resource
 def init_db():
     db_file = "lnt_data.db"
-    # Clean up old DB file if it exists to start fresh
-    if os.path.exists(db_file):
-        os.remove(db_file)
-        
     con = duckdb.connect(db_file)
-    
-    # Load Data
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx", engine="openpyxl")
-        con.execute("CREATE TABLE pnl_data AS SELECT * FROM df_pnl")
-        
+        con.execute("CREATE OR REPLACE TABLE pnl_data AS SELECT * FROM df_pnl")
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx", engine="openpyxl")
-        con.execute("CREATE TABLE ut_data AS SELECT * FROM df_ut")
-    
+        con.execute("CREATE OR REPLACE TABLE ut_data AS SELECT * FROM df_ut")
     con.close()
-    
-    # We add 'view_support=False' to simplify the reflection process
     return SQLDatabase.from_uri(f"duckdb:///{db_file}", view_support=False)
 
-@st.cache_data
-def get_kpi_context():
-    if os.path.exists("kpi_directory.xlsx"):
-        df_kpi = pd.read_excel("kpi_directory.xlsx", engine="openpyxl")
-        return df_kpi.to_string()
-    return "No KPI directory found."
+db = init_db()
 
-# Initialize
-try:
-    db = init_db()
-    kpi_context = get_kpi_context()
-except Exception as e:
-    st.error(f"Critical Database Error: {e}")
-    st.stop()
+# 2. Memory Setup (Persistent Chat)
+msgs = StreamlitChatMessageHistory(key="chat_messages")
+memory = ConversationBufferMemory(memory_key="chat_history", chat_memory=msgs, return_messages=True)
 
-# 3. Agent Setup
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+# 3. Enhanced Prompt for Accuracy
+full_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a senior L&T Financial Analyst. Use 'pnl_data' and 'ut_data'. 
+    RULES FOR ACCURACY:
+    - ALWAYS check table schemas before querying.
+    - If asked for a trend or comparison, suggest a chart.
+    - Use 'Amount in USD' for financial totals.
+    - If the user asks for a chart, provide the data in a clear table first."""),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+# 4. Agent Setup
+llm = ChatOpenAI(model="gpt-4o", temperature=0) # Temp 0 for maximum accuracy
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-
-system_message = f"""
-You are a senior L&T Financial Analyst. Use 'pnl_data' and 'ut_data' tables.
-KPI RULES: {kpi_context}
-"""
 
 agent_executor = create_sql_agent(
     llm=llm,
     toolkit=toolkit,
     verbose=True,
     agent_type="openai-tools",
-    extra_prompt_messages=[("system", system_message)]
+    prompt=full_prompt
 )
 
-# 4. Chat Interface
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# 5. Chat & Chart Logic
+for msg in msgs.messages:
+    st.chat_message(msg.type).write(msg.content)
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("Ask: What is the total FMCG Revenue?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
+if prompt := st.chat_input("Ask: Plot the revenue trend for FMCG"):
+    st.chat_message("human").write(prompt)
+    
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing..."):
-            try:
-                response = agent_executor.invoke({"input": prompt})
-                st.markdown(response["output"])
-                st.session_state.messages.append({"role": "assistant", "content": response["output"]})
-            except Exception as e:
-                st.error(f"Agent Error: {e}")
+        with st.spinner("Analyzing and calculating..."):
+            # Load memory into the execution context
+            hist = memory.load_memory_variables({})["chat_history"]
+            response = agent_executor.invoke({"input": prompt, "chat_history": hist})
+            
+            # 6. Chart Logic: If the agent provides data, we can visualize it
+            st.write(response["output"])
+            
+            # Example: Simple keyword trigger for a Plotly chart
+            if "revenue" in prompt.lower() and "trend" in prompt.lower():
+                try:
+                    # Quick fetch for a chart (Direct query to avoid hallucination)
+                    con = duckdb.connect("lnt_data.db")
+                    chart_df = con.execute("SELECT Month, SUM(\"Amount in USD\") as Revenue FROM pnl_data GROUP BY Month ORDER BY Month").df()
+                    fig = px.line(chart_df, x="Month", y="Revenue", title="Revenue Trend Analysis")
+                    st.plotly_chart(fig)
+                    con.close()
+                except:
+                    pass
