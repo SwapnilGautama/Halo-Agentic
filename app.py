@@ -5,104 +5,134 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA PRE-PROCESSOR (The "Truth" Layer) ---
+# --- 1. DATA ENGINE (The Foundation) ---
 @st.cache_resource
-def load_and_standardize_data():
+def init_engine():
     conn = duckdb.connect(database=':memory:')
     
-    # Load UT Data
+    # Load standardized files
+    # Expecting: pnl_data (Month, FinalCustomerName, USD, Type, Group1)
+    # Expecting: ut_data (Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours)
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
-        # Standardize Date_a to a real SQL Date
-        df_ut['Standard_Date'] = pd.to_datetime(df_ut['Date_a'])
-        # Rename to match Directory terminology
-        df_ut = df_ut.rename(columns={"FinalCustomerName": "Customer_Name", "PSNo": "Employee_ID"})
+        df_ut['Date'] = pd.to_datetime(df_ut['Date'])
         conn.register("ut_data", df_ut)
 
-    # Load PNL Data
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
-        # Standardize Month (e.g. "Sunday, June 1...") to a real SQL Date
-        df_pnl['Standard_Date'] = pd.to_datetime(df_pnl['Month'])
-        df_pnl = df_pnl.rename(columns={"FinalCustomerName": "Customer_Name", "Amount in USD": "USD_Value"})
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'])
         conn.register("pnl_data", df_pnl)
 
-    # Load Knowledge Assets
+    # Load Knowledge Directories
     kpi_lib = pd.read_excel("kpi_directory.xlsx").to_string() if os.path.exists("kpi_directory.xlsx") else ""
     field_lib = pd.read_excel("field_directory.xlsx").to_string() if os.path.exists("field_directory.xlsx") else ""
     
     return conn, kpi_lib, field_lib
 
-conn, kpi_context, field_context = load_and_standardize_data()
+conn, kpi_ctx, field_ctx = init_engine()
 
-# --- 2. MULTI-AGENT EXECUTION ---
-def run_ai_analyst(user_query):
+# --- 2. MULTI-AGENT ANALYST ---
+def run_financial_analysis(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # ARCHITECT AGENT: SQL Generation
-    architect_instruction = f"""
-    You are a Lead Financial Architect. You MUST use these two directories as your ONLY source of truth:
-    1. FIELD DIRECTORY: {field_context}
-    2. KPI DIRECTORY: {kpi_context}
+    # ARCHITECT: Strictly maps the query to the Directory rules
+    architect_prompt = f"""
+    You are a Financial Systems Architect. Use the following directories as your ONLY source of truth.
+    
+    FIELD DIRECTORY: {field_ctx}
+    KPI DIRECTORY: {kpi_ctx}
 
-    DATABASE SCHEMA (Use these exact names):
-    - Table 'ut_data': [Standard_Date, Customer_Name, Employee_ID, TotalBillableHours, NetAvailableHours]
-    - Table 'pnl_data': [Standard_Date, Customer_Name, USD_Value, Type, Group1]
-
-    CRITICAL MATH RULES:
-    - Contribution Margin %: 
-        Numerator = (SUM(USD_Value) WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')) - (SUM(USD_Value) WHERE Type = 'Cost')
-        Denominator = (SUM(USD_Value) WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))
-        Result = (Numerator / Denominator) * 100
-    - Trend: Always group by 'Standard_Date' and ORDER BY 'Standard_Date' ASC.
-
-    Your SQL must return a 'Numerator', 'Denominator', and 'Final_Result' column.
+    RULES:
+    1. JOIN: If query needs both P&L and UT data, join on 'FinalCustomerName' AND 'Month' = 'Date'.
+    2. MARGIN %: 
+       - Numerator: (SUM(USD) FILTER (WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))) - (SUM(USD) FILTER (WHERE Type = 'Cost'))
+       - Denominator: SUM(USD) FILTER (WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))
+       - Final_Result: (Numerator / NULLIF(Denominator, 0)) * 100
+    3. FTE: COUNT(DISTINCT PSNo)
+    
+    OUTPUT:
+    You must return a SQL query that selects:
+    - The Dimension (e.g., FinalCustomerName or Month)
+    - The 'Numerator' (Calculated value)
+    - The 'Denominator' (Calculated value)
+    - The 'Final_Result' (The KPI result)
+    
+    Return ONLY the DuckDB SQL.
     """
     
-    sql = llm.invoke(architect_instruction + f"\nQuery: {user_query}").content.strip().replace("```sql", "").replace("```", "")
+    sql = llm.invoke(architect_prompt + f"\nUser Query: {user_query}").content.strip().replace("```sql", "").replace("```", "")
     
     try:
         df = conn.execute(sql).df()
-        return sql, df
+        
+        # VIZ AGENT: Decides best chart based on data shape
+        viz_prompt = f"Data columns: {list(df.columns)}. If the first column is a date, return 'line'. If it's a category/customer, return 'bar'. 1 word only."
+        chart_choice = llm.invoke(viz_prompt).content.strip().lower()
+        
+        return sql, df, chart_choice
     except Exception as e:
-        return sql, str(e)
+        return sql, None, str(e)
 
-# --- 3. THE UI ---
+# --- 3. THE INTERFACE ---
 st.title("🏛️ L&T Executive Intelligence")
-query = st.text_input("Ask a question (e.g., 'Margin % trend by customer'):")
+st.markdown("---")
+
+query = st.text_input("Ask a question (e.g., 'Contribution Margin by Customer' or 'FTE trend'):")
 
 if query:
-    sql, result = run_ai_analyst(query)
+    sql, df, chart_type = run_financial_analysis(query)
     
-    if isinstance(result, pd.DataFrame):
-        tab1, tab2 = st.tabs(["📊 CFO Dashboard", "🔍 Calculation Audit"])
+    if df is not None:
+        tab1, tab2 = st.tabs(["📊 Executive Dashboard", "🔍 Logic & Details"])
         
         with tab1:
-            # Concise Analyst Summary
-            llm = ChatOpenAI(model="gpt-4o", temperature=0)
-            summary = llm.invoke(f"Summarize this in 2 bullets: {result.head().to_string()}").content
-            st.info(summary)
+            # CFO Narrative Summary
+            llm_summary = ChatOpenAI(model="gpt-4o", temperature=0)
+            summary = llm_summary.invoke(f"Provide a 1-sentence CFO insight on these results: {df.head(5).to_string()}").content
+            st.info(f"**Analyst Insight:** {summary}")
             
-            # Dynamic Matplotlib Chart
+            # Professional Visualization
             fig, ax = plt.subplots(figsize=(10, 4))
-            x_col = result.columns[0]
-            y_col = 'Final_Result' if 'Final_Result' in result.columns else result.columns[-1]
+            x_col = df.columns[0]
+            y_col = 'Final_Result'
             
-            # Logic to pick Bar or Line
-            if "Date" in str(x_col) or len(result) > 10:
-                ax.plot(result[x_col].astype(str), result[y_col], marker='o', color='#00529B')
+            if 'line' in chart_type:
+                ax.plot(df[x_col].astype(str), df[y_col], marker='o', color='#00529B', linewidth=2)
             else:
-                ax.bar(result[x_col].astype(str), result[y_col], color='#00529B')
+                ax.bar(df[x_col].astype(str), df[y_col], color='#00529B')
             
             plt.xticks(rotation=45)
+            ax.set_ylabel(y_col)
+            ax.set_title(query, fontweight='bold')
             st.pyplot(fig)
-            st.dataframe(result)
+            
+            # Simple Output Table
+            st.write("### Data Table")
+            st.dataframe(df[[x_col, 'Final_Result']])
 
         with tab2:
-            st.subheader("Data Lineage")
-            st.write("**Fields Used:** Standard_Date, Customer_Name, USD_Value")
-            st.write("**Generated SQL:**")
-            st.code(sql)
+            st.subheader("Audit Trail")
+            st.markdown("This tab provides full transparency into the AI's calculation logic.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Fields Used:**")
+                st.write(f"- Table 1: `pnl_data` (USD, Type, Group1)")
+                st.write(f"- Table 2: `ut_data` (PSNo, Date)")
+            
+            with col2:
+                st.write("**Formula Applied:**")
+                if "Margin" in query:
+                    st.latex(r"Margin \% = \frac{Revenue - Cost}{Revenue} \times 100")
+                elif "FTE" in query:
+                    st.latex(r"FTE = Count(Distinct(PSNo))")
+            
+            st.markdown("---")
+            st.write("**Calculation Components (Numerator & Denominator):**")
+            st.dataframe(df) # Shows the full breakdown
+            
+            st.write("**Generated SQL Query:**")
+            st.code(sql, language='sql')
     else:
-        st.error(f"Logic Error: {result}")
+        st.error(f"Execution Error: {chart_type}")
         st.code(sql)
