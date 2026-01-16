@@ -5,93 +5,126 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-st.set_page_config(page_title="L&T Financial AI", layout="wide")
-st.title("🏛️ L&T AI Financial System")
+# --- SETTINGS ---
+st.set_page_config(page_title="L&T Financial AI 2.0", layout="wide")
+st.title("🏛️ L&T Executive Financial Dashboard")
 
-# 1. DATABASE & KNOWLEDGE INITIALIZATION
+# 1. CLEAN ROOM DATA LOADING
 @st.cache_resource
-def init_system():
+def load_and_clean_data():
     conn = duckdb.connect(database=':memory:')
     
-    # Load Directories
-    field_rules = pd.read_excel("field_directory.xlsx").to_string(index=False) if os.path.exists("field_directory.xlsx") else ""
-    kpi_rules = pd.read_excel("kpi_directory.xlsx").to_string(index=False) if os.path.exists("kpi_directory.xlsx") else ""
-    
-    # --- LOAD & SANITIZE UT DATA ---
+    # Load UT Data & Standardize
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
-        # Ensure Date_a is a real date
+        # Step 1: Force Date conversion
         df_ut['Date_a'] = pd.to_datetime(df_ut['Date_a'])
-        # PHYSICAL LOCKDOWN: Rename original numeric Month/Year so AI can't find them
-        df_ut.rename(columns={"Month": "HIDDEN_MONTH", "Year": "HIDDEN_YEAR"}, inplace=True)
-        conn.register("ut_tmp", df_ut)
-        conn.execute("CREATE TABLE ut_data AS SELECT * FROM ut_tmp")
+        # Step 2: Rename for the Architect (removing ambiguity)
+        df_ut = df_ut.rename(columns={
+            "Date_a": "EntryDate",
+            "FinalCustomerName": "Customer",
+            "PSNo": "EmployeeID",
+            "Month": "Raw_Month_Num", # Hide the original
+            "Year": "Raw_Year"         # Hide the original
+        })
+        conn.register("ut_data", df_ut)
 
-    # --- LOAD & SANITIZE PNL DATA ---
+    # Load P&L Data & Standardize
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
-        # Ensure 'Month' label is consistent
-        df_pnl.rename(columns={"Month": "Month_Label"}, inplace=True)
-        conn.register("pnl_tmp", df_pnl)
-        conn.execute("CREATE TABLE pnl_data AS SELECT * FROM pnl_tmp")
-            
-    return conn, kpi_rules, field_rules
+        # Force the P&L 'Month' (which is a date string) into a real date
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'])
+        df_pnl = df_pnl.rename(columns={
+            "Month": "EntryDate",
+            "FinalCustomerName": "Customer",
+            "Amount in USD": "USD_Value"
+        })
+        conn.register("pnl_data", df_pnl)
 
-conn, kpi_defs, field_defs = init_system()
-
-# --- SIDEBAR DATA INSPECTOR ---
-with st.sidebar:
-    st.header("🔍 Data Inspector")
-    if st.checkbox("Show Table Schemas"):
-        st.subheader("ut_data Columns")
-        st.write(conn.execute("DESCRIBE ut_data").df()[['column_name', 'column_type']])
+    # Load Directories for Agent Context
+    field_ctx = pd.read_excel("field_directory.xlsx").to_string() if os.path.exists("field_directory.xlsx") else ""
+    kpi_ctx = pd.read_excel("kpi_directory.xlsx").to_string() if os.path.exists("kpi_directory.xlsx") else ""
     
-    if st.checkbox("Preview ut_data (First 5 Rows)"):
-        st.dataframe(conn.execute("SELECT * FROM ut_data LIMIT 5").df())
+    return conn, field_ctx, kpi_ctx
 
-# --- ARCHITECT AGENT ---
-if prompt := st.chat_input("FTE trend by Customer Name for Feb 2025"):
-    with st.chat_message("assistant"):
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
+conn, field_context, kpi_context = load_and_clean_data()
+
+# 2. THE MULTI-AGENT ARCHITECTURE
+def run_ai_system(user_query):
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+    # --- AGENT 1: THE ARCHITECT (SQL Generation) ---
+    # We provide a "Clean Schema" to the architect so it doesn't get confused
+    architect_prompt = f"""
+    You are the Lead Data Architect. Use the following CLEAN SCHEMA to write DuckDB SQL.
+    
+    TABLE: ut_data
+    - EntryDate (DATE): Use for all time filters.
+    - Customer (VARCHAR): The Client/Customer name.
+    - EmployeeID (VARCHAR): Use for FTE/Headcount (COUNT DISTINCT).
+    - Status (VARCHAR): Billable/Non-Billable.
+
+    TABLE: pnl_data
+    - EntryDate (DATE): Use for all time filters.
+    - Customer (VARCHAR): The Client/Customer name.
+    - USD_Value (DOUBLE): All financial amounts (Revenue/Cost).
+    - Type (VARCHAR): 'Revenue' or 'Cost'.
+
+    DATE LOGIC:
+    - Feb 2025: WHERE EntryDate = '2025-02-01' (or use MONTH()/YEAR() functions)
+    - Trends: Group by EntryDate and ORDER BY EntryDate ASC.
+
+    KPI LOGIC:
+    {kpi_context}
+
+    Return ONLY the SQL.
+    """
+    
+    sql = llm.invoke(architect_prompt + f"\nUser: {user_query}").content.strip().replace("```sql", "").replace("```", "")
+    
+    try:
+        results_df = conn.execute(sql).df()
         
-        system_instruction = f"""
-        You are the L&T Financial Architect. 
+        # --- AGENT 2: THE ANALYST (Narrative) ---
+        analysis = llm.invoke(f"As a CFO, explain these results: {results_df.to_string()}").content
         
-        FIELD DIRECTORY: {field_defs}
-        KPI DIRECTORY: {kpi_defs}
+        return sql, results_df, analysis
+    except Exception as e:
+        return sql, None, str(e)
+
+# 3. UI LAYOUT
+with st.sidebar:
+    st.header("🔍 System Health")
+    if st.checkbox("Inspect Clean Schema"):
+        st.write("UT Table:")
+        st.write(conn.execute("DESCRIBE ut_data").df()[['column_name', 'column_type']])
+        st.write("P&L Table:")
+        st.write(conn.execute("DESCRIBE pnl_data").df()[['column_name', 'column_type']])
+
+query = st.text_input("Ask your financial question:", placeholder="e.g., What is the FTE trend for Customer A36?")
+
+if query:
+    sql, df, analysis = run_ai_system(query)
+    
+    if df is not None:
+        st.subheader("📊 Executive Analysis")
+        st.markdown(analysis)
         
-        STRICT DATE RULES (ut_data):
-        1. "Date_a" is the ONLY field for dates.
-        2. Filter Feb 2025 like this: `WHERE MONTH("Date_a") = 2 AND YEAR("Date_a") = 2025`.
-        3. For trends, group by: `strftime("Date_a", '%Y-%m')` and ORDER BY "Date_a" ASC.
-        
-        MANDATORY KPI:
-        - FTE / Headcount = COUNT(DISTINCT "PSNo")
-        - Customer = "FinalCustomerName"
-        
-        Write ONLY the DuckDB SQL. Use double quotes for columns.
-        """
-        
-        sql = llm.invoke(system_instruction + f"\nQuestion: {prompt}").content.strip().replace("```sql", "").replace("```", "")
-        
-        try:
-            df = conn.execute(sql).df()
-            st.write(f"### Results for: {prompt}")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.write("**Data Extract**")
             st.dataframe(df)
-            
-            # --- MATPLOTLIB VISUALS ---
+        
+        with col2:
+            st.write("**Visual Trend**")
             if not df.empty and len(df.columns) >= 2:
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(df.iloc[:, 0].astype(str), df.iloc[:, 1], marker='s', color='#1f77b4', linewidth=2)
-                ax.set_title(prompt, fontsize=12, fontweight='bold')
-                ax.grid(True, linestyle='--', alpha=0.5)
+                # --- AGENT 3: VISUALIZATION (Matplotlib) ---
+                fig, ax = plt.subplots()
+                ax.plot(df.iloc[:,0].astype(str), df.iloc[:,1], marker='o', color='#00529B', linewidth=2)
+                ax.set_title(query, fontsize=10)
                 plt.xticks(rotation=45)
+                ax.grid(True, alpha=0.3)
                 st.pyplot(fig)
-            
-            # CFO Analysis
-            analysis = llm.invoke(f"As CFO, summarize this trend: {df.to_string()}").content
-            st.markdown(analysis)
-            
-        except Exception as e:
-            st.error(f"SQL Error: {e}")
-            st.code(sql)
+    else:
+        st.error(f"The Architect generated an invalid query: {analysis}")
+        st.code(sql)
