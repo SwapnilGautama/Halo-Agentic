@@ -9,3 +9,5 @@ langgraph
 sqlalchemy==2.0.35
 plotly
 openpyxl
+matplotlib
+
