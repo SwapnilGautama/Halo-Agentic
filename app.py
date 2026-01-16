@@ -5,67 +5,53 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (The "Standardizer") ---
+# --- 1. DATA ENGINE ---
 @st.cache_resource
-def load_and_clean_data():
+def load_and_register_data():
     conn = duckdb.connect(database=':memory:')
     
-    # Process PNL Data
+    # Load P&L (Strict Column Alignment)
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
-        df_pnl.columns = [c.strip() for c in df_pnl.columns]
-        
-        # KEY FIX: Standardizing the names the AI expects
-        df_pnl = df_pnl.rename(columns={
-            'Amount in USD': 'USD_Amount', 
-            'FinalCustomerName': 'Customer',
-            'Month': 'Period'
-        })
-        df_pnl['Period'] = pd.to_datetime(df_pnl['Period'], errors='coerce')
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
         conn.register("pnl_data", df_pnl)
 
-    # Process UT Data
+    # Load UT (Strict Column Alignment)
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
-        df_ut.columns = [c.strip() for c in df_ut.columns]
-        
-        # KEY FIX: Standardizing for UT table
-        df_ut = df_ut.rename(columns={
-            'Date': 'Period', 
-            'Date_a': 'Period', # Catches both variations
-            'FinalCustomerName': 'Customer'
-        })
-        df_ut['Period'] = pd.to_datetime(df_ut['Period'], errors='coerce')
+        df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
         conn.register("ut_data", df_ut)
 
     return conn
 
-conn = load_and_clean_data()
+conn = load_and_register_data()
 
-# --- 2. AI ARCHITECT (With Forced Logic) ---
-def execute_query(user_query):
+# --- 2. THE ANALYST (Aligned to KPI Directory) ---
+def run_analyst(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    system_prompt = f"""
-    You are a Financial Data Analyst. 
-    TABLES AVAILABLE:
-    - pnl_data: [Period, Customer, USD_Amount, Type, Group1, Group2, Group3]
-    - ut_data: [Period, Customer, PSNo, Status, TotalBillableHours, NetAvailableHours]
+    system_prompt = """
+    You are a Financial Data Analyst.
+    TABLES:
+    - pnl_data: Columns [Month, FinalCustomerName, "Amount in USD", Type, Group1, Group3]
+    - ut_data: Columns [Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours]
 
-    KPI RULES:
-    - Revenue: SUM(USD_Amount) FILTER (WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))
-    - Total Cost: SUM(USD_Amount) FILTER (WHERE Type = 'Cost')
-    - C&B Cost: SUM(USD_Amount) FILTER (WHERE Type = 'Cost' AND Group3 LIKE '%C&B%')
-    - Margin %: ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
+    JOIN MANDATE:
+    For any KPI involving BOTH tables (RPP, Billed Rate, Realized Rate), you MUST JOIN on:
+    pnl_data.FinalCustomerName = ut_data.FinalCustomerName 
+    AND STRFTIME(pnl_data.Month, '%Y-%m') = STRFTIME(ut_data.Date, '%Y-%m')
 
-    SQL RULES:
-    - Always JOIN on Customer AND Month: 
-      pnl_data.Customer = ut_data.Customer AND STRFTIME(pnl_data.Period, '%Y-%m') = STRFTIME(ut_data.Period, '%Y-%m')
-    - Output ONLY the DuckDB SQL query.
+    KPI REFRESHER:
+    - Revenue: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+    - C&B Cost: SUM("Amount in USD") WHERE Type = 'Cost' AND Group3 LIKE '%C&B%'
+    - Headcount: COUNT(DISTINCT PSNo)
+
+    OUTPUT FORMAT:
+    Select the Dimension, then the Numerator, then the Denominator, then the Final_Result.
+    Return ONLY the SQL.
     """
     
-    response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
-    sql = response.content.strip().replace("```sql", "").replace("```", "")
+    sql = llm.invoke(system_prompt + f"\nUser Query: {user_query}").content.strip().replace("```sql", "").replace("```", "")
     
     try:
         df = conn.execute(sql).df()
@@ -73,29 +59,30 @@ def execute_query(user_query):
     except Exception as e:
         return sql, f"SQL Error: {str(e)}"
 
-# --- 3. THE INTERFACE ---
+# --- 3. UI ---
 st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v7.0")
+st.title("🏛️ L&T Executive Analyst v10.0")
 
-user_input = st.text_input("Ask a question (e.g., 'What is the C&B cost as % of revenue trend?')")
+user_input = st.text_input("Query (e.g., 'What is the Billed Rate trend for A1?')")
 
 if user_input:
-    sql, result = execute_query(user_input)
+    sql, result = run_analyst(user_input)
     
     if isinstance(result, pd.DataFrame):
-        if result.empty:
-            st.warning("Query returned no data. Check if names/dates match in both files.")
-        else:
-            st.write("### Analysis Result")
-            st.dataframe(result)
-            
-            # Auto-charting logic
-            if len(result.columns) >= 2:
+        tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
+        
+        with tab1:
+            st.dataframe(result.iloc[:, [0, -1]]) # Shows Date/Customer and the KPI result
+            if len(result) > 1:
                 fig, ax = plt.subplots(figsize=(10, 4))
                 ax.plot(result.iloc[:, 0].astype(str), result.iloc[:, -1], marker='o')
-                plt.xticks(rotation=45)
                 st.pyplot(fig)
+
+        with tab2:
+            st.markdown("### 🔍 Calculation Audit")
+            st.write("Full breakdown including Numerator and Denominator:")
+            st.dataframe(result)
+            st.write("**Generated SQL:**")
+            st.code(sql, language='sql')
     else:
         st.error(result)
-        st.info("Technical SQL generated:")
-        st.code(sql)
