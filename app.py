@@ -5,18 +5,16 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE ---
+# --- 1. DATA ENGINE (Load exact headers) ---
 @st.cache_resource
-def load_and_register_data():
+def load_data():
     conn = duckdb.connect(database=':memory:')
     
-    # Load P&L (Strict Column Alignment)
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
         df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
         conn.register("pnl_data", df_pnl)
 
-    # Load UT (Strict Column Alignment)
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
         df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
@@ -24,65 +22,88 @@ def load_and_register_data():
 
     return conn
 
-conn = load_and_register_data()
+conn = load_data()
 
-# --- 2. THE ANALYST (Aligned to KPI Directory) ---
-def run_analyst(user_query):
+# --- 2. THE ANALYST ENGINE (v11.0) ---
+def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
+    # System prompt updated with Segment logic and Greeting handling
     system_prompt = """
-    You are a Financial Data Analyst.
+    You are an Executive Financial Assistant for L&T. 
+    
+    CAPABILITIES:
+    1. Answer greetings and explain your purpose (analyzing P&L and Utilization data).
+    2. Generate SQL queries for financial KPIs.
+    
     TABLES:
-    - pnl_data: Columns [Month, FinalCustomerName, "Amount in USD", Type, Group1, Group3]
-    - ut_data: Columns [Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours]
+    - pnl_data: [Month, FinalCustomerName, "Amount in USD", Type, Group1, Group3, Segment]
+    - ut_data: [Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours, Segment]
 
-    JOIN MANDATE:
-    For any KPI involving BOTH tables (RPP, Billed Rate, Realized Rate), you MUST JOIN on:
-    pnl_data.FinalCustomerName = ut_data.FinalCustomerName 
-    AND STRFTIME(pnl_data.Month, '%Y-%m') = STRFTIME(ut_data.Date, '%Y-%m')
-
-    KPI REFRESHER:
-    - Revenue: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
-    - C&B Cost: SUM("Amount in USD") WHERE Type = 'Cost' AND Group3 LIKE '%C&B%'
-    - Headcount: COUNT(DISTINCT PSNo)
+    FIELD MAPPING RULES:
+    - If user asks for 'Segment' with 'Utilization' or 'FTE', use ut_data.Segment.
+    - If user asks for 'Segment' with 'Revenue' or 'Cost', use pnl_data.Segment.
+    - If a query needs BOTH tables (RPP, Billed Rate, etc.), JOIN on:
+      pnl_data.FinalCustomerName = ut_data.FinalCustomerName 
+      AND STRFTIME(pnl_data.Month, '%Y-%m') = STRFTIME(ut_data.Date, '%Y-%m')
 
     OUTPUT FORMAT:
-    Select the Dimension, then the Numerator, then the Denominator, then the Final_Result.
-    Return ONLY the SQL.
+    - For GREETINGS: Return a friendly text response.
+    - For DATA QUERIES: Return ONLY the SQL query. Always select: [Dimension, Numerator, Denominator, Final_Result].
     """
     
-    sql = llm.invoke(system_prompt + f"\nUser Query: {user_query}").content.strip().replace("```sql", "").replace("```", "")
+    response = llm.invoke(system_prompt + f"\nUser Input: {user_query}")
+    content = response.content.strip()
     
-    try:
-        df = conn.execute(sql).df()
-        return sql, df
-    except Exception as e:
-        return sql, f"SQL Error: {str(e)}"
+    # Check if the response is a SQL query or a conversational response
+    if "SELECT" in content.upper() and "FROM" in content.upper():
+        sql = content.replace("```sql", "").replace("```", "")
+        try:
+            df = conn.execute(sql).df()
+            return "DATA", sql, df
+        except Exception as e:
+            return "ERROR", sql, f"SQL Error: {str(e)}"
+    else:
+        return "CHAT", None, content
 
-# --- 3. UI ---
-st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v10.0")
+# --- 3. UI LAYOUT ---
+st.set_page_config(layout="wide", page_title="L&T Analyst v11")
+st.title("🏛️ L&T Executive Analyst v11.0")
 
-user_input = st.text_input("Query (e.g., 'What is the Billed Rate trend for A1?')")
+query = st.text_input("How can I help you today?")
 
-if user_input:
-    sql, result = run_analyst(user_input)
+if query:
+    mode, sql, result = execute_ai_query(query)
     
-    if isinstance(result, pd.DataFrame):
+    if mode == "CHAT":
+        st.write(result)
+        
+    elif mode == "DATA" and isinstance(result, pd.DataFrame):
+        # --- Point 4: RESTORED 2-POINT INSIGHTS ---
+        if not result.empty:
+            avg_val = result.iloc[:, -1].mean()
+            max_row = result.loc[result.iloc[:, -1].idxmax()]
+            
+            st.info(f"💡 **Executive Insights:**\n"
+                    f"1. The average result for this period is **{avg_val:,.2f}**.\n"
+                    f"2. Peak performance was observed in **{max_row.iloc[0]}** with a value of **{max_row.iloc[-1]:,.2f}**.")
+
         tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
         
         with tab1:
-            st.dataframe(result.iloc[:, [0, -1]]) # Shows Date/Customer and the KPI result
+            st.dataframe(result.iloc[:, [0, -1]])
             if len(result) > 1:
                 fig, ax = plt.subplots(figsize=(10, 4))
-                ax.plot(result.iloc[:, 0].astype(str), result.iloc[:, -1], marker='o')
+                ax.plot(result.iloc[:, 0].astype(str), result.iloc[:, -1], marker='o', color='#00529B')
+                plt.xticks(rotation=45)
                 st.pyplot(fig)
 
         with tab2:
             st.markdown("### 🔍 Calculation Audit")
-            st.write("Full breakdown including Numerator and Denominator:")
+            st.code(sql, language="sql")
+            st.write("**Full Raw Data Table:**")
             st.dataframe(result)
-            st.write("**Generated SQL:**")
-            st.code(sql, language='sql')
-    else:
+            
+    elif mode == "ERROR":
         st.error(result)
+        st.code(sql)
