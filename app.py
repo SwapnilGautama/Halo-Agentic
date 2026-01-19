@@ -2,11 +2,15 @@ import streamlit as st
 import duckdb
 import pandas as pd
 import os
+import json
+import hashlib
 
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
 from agents.bi import BIAgent
 from agents.validator import ValidationAgent
+from utils.logger import log_event
+import config
 
 # -------------------------------------------------
 # Streamlit Config
@@ -30,12 +34,6 @@ def save_intent(intent):
 
 
 def merge_with_memory(new_intent, last_intent):
-    """
-    Merge new intent with previous intent.
-    Rules:
-    - New values override old ones
-    - Missing values inherit from memory
-    """
     if not last_intent:
         return new_intent
 
@@ -44,31 +42,25 @@ def merge_with_memory(new_intent, last_intent):
         "filters": last_intent.get("filters", {}).copy(),
         "comparison": new_intent.get("comparison") or last_intent.get("comparison"),
     }
-
     merged["filters"].update(new_intent.get("filters", {}))
     return merged
 
 
 # -------------------------------------------------
-# Load Data into DuckDB
+# DuckDB Loader
 # -------------------------------------------------
 @st.cache_resource
 def load_duckdb():
     conn = duckdb.connect(database=":memory:")
 
-    pnl_path = "data/pnl_data.xlsx"
-    ut_path = "data/ut_data.xlsx"
+    pnl_df = pd.read_excel(config.DATA_PATHS["PNL"])
+    pnl_df["Month"] = pd.to_datetime(pnl_df["Month"], errors="coerce")
+    conn.register("pnl_data", pnl_df)
 
-    if os.path.exists(pnl_path):
-        pnl_df = pd.read_excel(pnl_path)
-        pnl_df["Month"] = pd.to_datetime(pnl_df["Month"], errors="coerce")
-        conn.register("pnl_data", pnl_df)
-
-    if os.path.exists(ut_path):
-        ut_df = pd.read_excel(ut_path)
-        ut_df["Date"] = pd.to_datetime(ut_df["Date"], errors="coerce")
-        ut_df["Month"] = ut_df["Date"].dt.to_period("M").dt.to_timestamp()
-        conn.register("ut_data", ut_df)
+    ut_df = pd.read_excel(config.DATA_PATHS["UT"])
+    ut_df["Date"] = pd.to_datetime(ut_df["Date"], errors="coerce")
+    ut_df["Month"] = ut_df["Date"].dt.to_period("M").dt.to_timestamp()
+    conn.register("ut_data", ut_df)
 
     return conn
 
@@ -76,12 +68,20 @@ def load_duckdb():
 conn = load_duckdb()
 
 # -------------------------------------------------
+# Cached SQL Execution
+# -------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=config.CACHE_TTL)
+def cached_query(sql):
+    return conn.execute(sql).df()
+
+
+# -------------------------------------------------
 # Initialize Agents
 # -------------------------------------------------
 architect = ArchitectAgent(
     kpi_directory_path="metadata/kpi_directory.xlsx",
     prompt_path="prompts/architect_prompt.txt",
-    model="gpt-4o"
+    model=config.MODEL_NAME
 )
 
 analyst = AnalystAgent()
@@ -89,17 +89,17 @@ bi = BIAgent()
 validator = ValidationAgent()
 
 # -------------------------------------------------
-# Sidebar: Current Context (Conversation Memory)
+# Sidebar Context
 # -------------------------------------------------
 with st.sidebar:
     st.markdown("### 🧠 Current Context")
     if get_last_intent():
         st.json(get_last_intent())
     else:
-        st.write("No active context yet")
+        st.write("No active context")
 
 # -------------------------------------------------
-# Main UI
+# UI
 # -------------------------------------------------
 st.markdown("### Ask a business question")
 user_query = st.text_input(
@@ -108,88 +108,86 @@ user_query = st.text_input(
 )
 
 if user_query:
-
-    # ---------------------------------------------
-    # 1. ARCHITECT AGENT (NL → Partial Intent)
-    # ---------------------------------------------
-    with st.spinner("🧠 Understanding your question..."):
+    try:
+        # -----------------------------
+        # Architect Agent
+        # -----------------------------
         raw_intent = architect.run(user_query)
+        intent = merge_with_memory(raw_intent, get_last_intent())
+        save_intent(intent)
 
-    # ---------------------------------------------
-    # 2. MERGE WITH CONVERSATION MEMORY
-    # ---------------------------------------------
-    last_intent = get_last_intent()
-    intent = merge_with_memory(raw_intent, last_intent)
-    save_intent(intent)
+        log_event("ARCHITECT_INTENT", intent)
 
-    if not intent or not intent.get("kpi_id"):
-        st.warning("Could not determine KPI. Please rephrase.")
-        st.stop()
+        if not intent.get("kpi_id"):
+            st.warning("Could not determine KPI.")
+            st.stop()
 
-    # ---------------------------------------------
-    # 3. ANALYST AGENT (SQL GENERATION)
-    # ---------------------------------------------
-    with st.spinner("📊 Generating SQL..."):
+        # -----------------------------
+        # Analyst Agent
+        # -----------------------------
         sql = analyst.generate_sql(
             kpi_id=intent["kpi_id"],
             filters=intent.get("filters", {}),
             comparison=intent.get("comparison")
         )
 
-    # ---------------------------------------------
-    # 4. SQL EXECUTION
-    # ---------------------------------------------
-    try:
-        df = conn.execute(sql).df()
-    except Exception as e:
-        st.error("❌ SQL execution failed")
-        st.code(sql, language="sql")
-        st.exception(e)
-        st.stop()
+        log_event("SQL_GENERATED", {"kpi": intent["kpi_id"], "sql": sql})
 
-    if df.empty:
-        st.warning("No data returned for this query.")
-        st.code(sql, language="sql")
-        st.stop()
+        # -----------------------------
+        # Execute SQL
+        # -----------------------------
+        df = cached_query(sql)
 
-    # ---------------------------------------------
-    # 5. VALIDATION AGENT
-    # ---------------------------------------------
-    warnings, errors = validator.validate(
-        kpi_id=intent["kpi_id"],
-        df=df,
-        comparison=intent.get("comparison")
-    )
+        if df.empty:
+            st.warning("No data returned.")
+            st.stop()
 
-    if errors:
-        st.error("❌ Data validation failed")
-        for err in errors:
-            st.error(err)
+        # -----------------------------
+        # Validation
+        # -----------------------------
+        warnings, errors = validator.validate(
+            intent["kpi_id"],
+            df,
+            intent.get("comparison")
+        )
 
-        with st.expander("🔍 SQL Audit"):
-            st.code(sql, language="sql")
-            st.dataframe(df, use_container_width=True)
+        log_event("VALIDATION", {"warnings": warnings, "errors": errors})
 
-        st.stop()
+        if errors:
+            st.error("❌ Data validation failed")
+            for e in errors:
+                st.error(e)
+            st.stop()
 
-    if warnings:
-        st.warning("⚠️ Data quality warnings detected")
-        for warn in warnings:
-            st.warning(warn)
+        for w in warnings:
+            st.warning(w)
 
-    # ---------------------------------------------
-    # 6. BI AGENT (VISUALS + INSIGHTS)
-    # ---------------------------------------------
-    with st.spinner("📈 Building visuals and insights..."):
+        # -----------------------------
+        # Row Safety
+        # -----------------------------
+        if config.MAX_ROWS and len(df) > config.MAX_ROWS:
+            st.warning(
+                f"Result truncated to first {config.MAX_ROWS} rows for display."
+            )
+            df = df.head(config.MAX_ROWS)
+
+        # -----------------------------
+        # BI Agent
+        # -----------------------------
         bi.render(
             kpi_id=intent["kpi_id"],
             df=df,
             comparison=intent.get("comparison")
         )
 
-    # ---------------------------------------------
-    # 7. SQL & DATA AUDIT
-    # ---------------------------------------------
-    with st.expander("🔍 SQL Audit & Raw Output"):
-        st.code(sql, language="sql")
-        st.dataframe(df, use_container_width=True)
+        # -----------------------------
+        # Audit
+        # -----------------------------
+        with st.expander("🔍 SQL & Data Audit"):
+            st.code(sql, language="sql")
+            st.dataframe(df, use_container_width=True)
+
+    except Exception as e:
+        log_event("UNHANDLED_ERROR", str(e))
+        st.error("⚠️ Something went wrong while processing your request.")
+        st.info("The issue has been logged. Please try rephrasing.")
