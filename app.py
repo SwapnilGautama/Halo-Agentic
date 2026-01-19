@@ -2,78 +2,143 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import os
+import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (The Foundation) ---
+# --- 1. DATA ENGINE (Robust DuckDB Foundation) ---
 @st.cache_resource
-def load_data():
+def load_and_configure_db():
     conn = duckdb.connect(database=':memory:')
-    # Load files and clean column names to prevent mapping errors
-    for file, table in [("pnl_data.xlsx", "pnl_data"), ("ut_data.xlsx", "ut_data")]:
-        if os.path.exists(file):
-            df = pd.read_excel(file)
-            if 'Month' in df.columns: df['Month'] = pd.to_datetime(df['Month'])
-            if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date'])
-            conn.register(table, df)
-    return conn
+    
+    # Load P&L Data
+    if os.path.exists("pnl_data.xlsx"):
+        pnl = pd.read_excel("pnl_data.xlsx")
+        pnl['Month'] = pd.to_datetime(pnl['Month'])
+        conn.register("pnl_data", pnl)
+        
+    # Load Utilization Data
+    if os.path.exists("ut_data.xlsx"):
+        ut = pd.read_excel("ut_data.xlsx")
+        ut['Date'] = pd.to_datetime(ut['Date'])
+        conn.register("ut_data", ut)
 
-conn = load_data()
+    # Load Directories for AI Context
+    field_dir = pd.read_excel("field_directory.xlsx").to_string()
+    kpi_dir = pd.read_excel("kpi_directory.xlsx").to_string()
+    
+    return conn, field_dir, kpi_dir
 
-# --- 2. THE SQL ARCHITECT (v20.0) ---
-def sql_architect(user_query):
+conn, FIELD_CONTEXT, KPI_CONTEXT = load_and_configure_db()
+
+# --- 2. THE MULTI-AGENT FACTORY ---
+def execute_complex_analyst(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+    # STAGE 1: INTENT & MAPPING
+    # This ensures the AI knows which columns to use based on your Field Directory
+    mapping_prompt = f"""
+    Reference these directories:
+    FIELDS: {FIELD_CONTEXT}
+    KPIs: {KPI_CONTEXT}
     
-    # This prompt acts as the "Architect" ensuring Multi-Pass SQL
-    architect_prompt = """
-    You are a Senior SQL Architect. Your goal is to generate error-proof DuckDB SQL.
+    User Query: {user_query}
     
-    CORE RULES FOR COMPLEX QUERIES:
-    1. For Ratios (Margin %, C&B %): You MUST use a CTE (WITH clause). 
-       - Pass 1: Aggregate Numerator (e.g., C&B_Cost)
-       - Pass 2: Aggregate Denominator (e.g., Revenue)
-       - Pass 3: Join them and calculate the %
-    
-    2. DATA MAPPING:
-       - Revenue: Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
-       - C&B Cost: Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
-       - Total Cost: Type = 'Cost'
-    
-    3. NAMING: Output 4 columns: [Dimension, Component_1_Name, Component_2_Name, Result_Percentage].
-    
-    4. DATE: June 2025 is '2025-06-01'.
+    Task: Identify if this requires a Ratio (Margin, C&B%, UT%) or a Sum. 
+    If Ratio, identify the Numerator Group and Denominator Group.
     """
     
+    # STAGE 2: THE SQL ARCHITECT (Multi-Pass CTE Generation)
+    # This is the "Comprehensive Fix" - it forces the AI to use the CTE pattern
+    architect_prompt = """
+    You are a Senior Financial SQL Architect for DuckDB.
+    
+    CRITICAL RULE: To calculate ratios (Margin %, C&B %, UT %), you MUST use the following CTE pattern:
+    
+    WITH 
+    Numerator AS (
+        SELECT {Dimension}, SUM("Amount in USD") as num_val 
+        FROM pnl_data WHERE {Numerator_Filters} GROUP BY 1
+    ),
+    Denominator AS (
+        SELECT {Dimension}, SUM("Amount in USD") as den_val 
+        FROM pnl_data WHERE {Denominator_Filters} GROUP BY 1
+    )
+    SELECT 
+        n.{Dimension}, 
+        n.num_val as Component_1, 
+        d.den_val as Component_2, 
+        ((n.num_val - d.den_val)/NULLIF(n.num_val, 0))*100 as Final_Result
+    FROM Numerator n
+    JOIN Denominator d ON n.{Dimension} = d.{Dimension}
+    
+    MAPPINGS FROM DIRECTORY:
+    - Revenue: Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+    - Total Cost: Type = 'Cost'
+    - C&B Cost: Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore')
+    - Utilization: Use ut_data table (TotalBillableHours / NetAvailableHours)
+    """
+
+    full_prompt = f"{architect_prompt}\n\nContext:\n{mapping_prompt}\n\nGenerate ONLY the SQL."
+    response = llm.invoke(full_prompt)
+    sql = response.content.strip().replace("```sql", "").replace("```", "")
+
     try:
-        response = llm.invoke(architect_prompt + f"\nUser Request: {user_query}")
-        sql = response.content.strip().replace("```sql", "").replace("```", "")
         df = conn.execute(sql).df()
         return "SUCCESS", sql, df
     except Exception as e:
-        return "ERROR", None, str(e)
+        return "ERROR", sql, str(e)
 
-# --- 3. UI ---
-st.title("🏛️ L&T Analyst v20.0 (Multi-Agent Architect)")
-st.caption("Structured for Complex SQL & CTE execution")
+# --- 3. UI LAYOUT (High-Density Dashboard) ---
+st.set_page_config(layout="wide", page_title="L&T Financial Analyst")
 
-query = st.text_input("Enter your complex financial query:")
+st.title("🏛️ L&T Executive Analyst v21.0")
+st.markdown("---")
 
-if query:
-    status, sql, result = sql_architect(query)
+# Question Sidebar (Handling your list of questions)
+with st.sidebar:
+    st.header("Suggested Queries")
+    sample_queries = [
+        "Margin % by Account for June 2025",
+        "C&B cost as % of revenue by Segment",
+        "Utilization % by Exec DG for June",
+        "Top 10 Customers by Revenue",
+        "FTE Count by Segment"
+    ]
+    for q in sample_queries:
+        if st.button(q):
+            st.session_state.current_query = q
+
+query_input = st.text_input("Analyze your data:", key="current_query")
+
+if query_input:
+    status, sql, result = execute_complex_analyst(query_input)
     
     if status == "SUCCESS":
-        st.success("Calculation Complete")
+        # Metric Row
+        res_col = result.columns[-1]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Average", f"{result[res_col].mean():,.2f}")
+        m2.metric("Maximum", f"{result[res_col].max():,.2f}")
+        m3.metric("Minimum", f"{result[res_col].min():,.2f}")
+
+        # Data & Viz Tabs
+        tab1, tab2, tab3 = st.tabs(["📊 Performance Chart", "🧾 Data Table", "🛠️ SQL Architect Log"])
         
-        # Insights & Breakdown
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Result (Avg)", f"{result.iloc[:,-1].mean():,.2f}%")
-        
-        tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Architect Logs"])
         with tab1:
-            st.dataframe(result, use_container_width=True)
+            if len(result) > 1:
+                fig, ax = plt.subplots(figsize=(10, 4))
+                result.plot(kind='bar', x=result.columns[0], y=res_col, ax=ax, color='#00529B')
+                plt.xticks(rotation=45)
+                st.pyplot(fig)
+            else:
+                st.info("Single data point returned. Bar chart disabled.")
+        
         with tab2:
-            st.write("**Architect's SQL Strategy:**")
+            st.dataframe(result, use_container_width=True)
+            
+        with tab3:
+            st.info("The Architect used the following logic to solve this:")
             st.code(sql, language="sql")
+            
     else:
-        st.error(f"Architect encountered an error: {result}")
-        st.info("This usually happens if a field name is missing or the date format is unrecognized.")
+        st.error(f"Architect Error: {result}")
