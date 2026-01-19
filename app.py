@@ -6,7 +6,7 @@ import re
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (Exact v15) ---
+# --- 1. DATA ENGINE (v15 Original - Untouched) ---
 @st.cache_resource
 def load_data():
     conn = duckdb.connect(database=':memory:')
@@ -22,70 +22,93 @@ def load_data():
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (Surgical Fix) ---
+# --- 2. THE ANALYST ENGINE (Hybrid logic) ---
 def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # Intent Classification (v15)
+    # Classification (v15 Original)
     intent_prompt = f"Classify as 'DATA' or 'CHAT'. Input: {user_query}. Output only the word."
     intent = llm.invoke(intent_prompt).content.strip().upper()
 
     if "CHAT" in intent:
         return "CHAT", None, llm.invoke(user_query).content
 
-    # Check for Margin Question
-    is_margin = any(w in user_query.lower() for w in ["margin", "profit %", "cm%", "cm %"])
+    # Logic Switch: Is it a Margin query?
+    is_margin = any(word in user_query.lower() for word in ["margin", "profit", "cm%", "cm %"])
 
     if is_margin:
-        # Colleague's Logic: Bucket Revenue and Cost separately
-        prompt = f"""
-        Generate a DuckDB SQL query for: {user_query}
-        Use this EXACT structure for Margin:
-        WITH Rev AS (SELECT FinalCustomerName, SUM("Amount in USD") as r FROM pnl_data WHERE Type='Revenue' AND Group1 IN ('ONSITE','OFFSHORE','INDIRECT REVENUE') GROUP BY 1),
-             Cost AS (SELECT FinalCustomerName, SUM("Amount in USD") as c FROM pnl_data WHERE Type='Cost' GROUP BY 1)
-        SELECT Rev.FinalCustomerName, Rev.r as Revenue, Cost.c as Cost, ((Rev.r - Cost.c)/NULLIF(Rev.r, 0))*100 as Margin_Perc
-        FROM Rev LEFT JOIN Cost ON Rev.FinalCustomerName = Cost.FinalCustomerName
+        # Use AI only to extract variables for your working query
+        extract_prompt = f"""
+        Extract from query: "{user_query}"
+        1. Dimension: 'Segment' or 'FinalCustomerName'.
+        2. DateFilter: SQL condition for 'Month' column (e.g., Month = '2025-06-01').
+        Output format: Dimension | DateFilter
+        """
+        params = llm.invoke(extract_prompt).content.strip().split("|")
+        dim = params[0].strip() if len(params) > 0 else "Segment"
+        date_clause = params[1].strip() if len(params) > 1 else "1=1"
+
+        # YOUR PROVIDED SQL QUERY (Templatized)
+        sql = f"""
+        WITH RevenueBucket AS (
+            SELECT "{dim}", SUM("Amount in USD") as total_rev 
+            FROM pnl_data 
+            WHERE Type = 'Revenue' AND Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE') AND {date_clause}
+            GROUP BY 1
+        ),
+        CostBucket AS (
+            SELECT "{dim}", SUM("Amount in USD") as total_cost 
+            FROM pnl_data 
+            WHERE Type = 'Cost' AND {date_clause}
+            GROUP BY 1
+        )
+        SELECT 
+            r."{dim}", r.total_rev as Revenue, c.total_cost as Cost,
+            ((r.total_rev - COALESCE(c.total_cost, 0)) / NULLIF(r.total_rev, 0)) * 100 as Margin_Perc
+        FROM RevenueBucket r
+        LEFT JOIN CostBucket c ON r."{dim}" = c."{dim}"
+        ORDER BY Margin_Perc ASC;
         """
     else:
-        # Standard v15 Logic for FTE, Revenue, etc.
-        prompt = f"Generate DuckDB SQL for: {user_query}. pnl_data (Month, Type, Group1, Amount in USD), ut_data (Date, PSNo, Segment). Output ONLY SQL."
-
-    response = llm.invoke(prompt).content
-    
-    # THE SHIELD: Remove "Certainly", "To", or markdown
-    sql = re.sub(r"```sql|```", "", response).strip()
-    sql_match = re.search(r"\b(SELECT|WITH)\b", sql, re.IGNORECASE)
-    if sql_match:
-        sql = sql[sql_match.start():]
+        # Fallback to standard v15 logic for FTE/Revenue
+        fallback_prompt = f"Generate DuckDB SQL for: {user_query}. Tables: pnl_data, ut_data. Output ONLY SQL."
+        sql_raw = llm.invoke(fallback_prompt).content
+        
+        # THE SHIELD: Strip "To", "Certainly", or markdown
+        sql = re.sub(r"```sql|```", "", sql_raw).strip()
+        sql_match = re.search(r"\b(SELECT|WITH)\b", sql, re.IGNORECASE)
+        if sql_match:
+            sql = sql[sql_match.start():]
 
     try:
-        result = conn.execute(sql).df()
-        return "DATA", sql, result
+        df = conn.execute(sql).df()
+        return "DATA", sql, df
     except Exception as e:
         return "ERROR", sql, str(e)
 
-# --- 3. UI (v15 Original) ---
+# --- 3. UI (v15 Original Layout) ---
 st.set_page_config(layout="wide")
-st.title("🏛️ L&T Analyst v15-Final-Fix")
+st.title("🏛️ L&T Executive Analyst v15.6")
 
-user_input = st.text_input("Ask a question:")
+user_input = st.text_input("Ask a question (e.g., FTE by Segment or Margin % for June 2025):")
 
 if user_input:
     mode, sql, result = execute_ai_query(user_input)
     
     if mode == "DATA" and not result.empty:
-        st.info(f"💡 Average: **{result.iloc[:,-1].mean():,.2f}**")
-        tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Details"])
-        with tab1:
+        st.info(f"💡 Period Average: **{result.iloc[:,-1].mean():,.2f}**")
+        t1, t2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
+        with t1:
             st.dataframe(result, use_container_width=True)
             if len(result) > 1:
                 fig, ax = plt.subplots(figsize=(10, 4))
                 ax.bar(result.iloc[:, 0].astype(str), result.iloc[:, -1], color='#00529B')
+                plt.xticks(rotation=45)
                 st.pyplot(fig)
-        with tab2:
+        with t2:
             st.code(sql, language="sql")
             st.dataframe(result)
     elif mode == "CHAT":
         st.write(result)
     else:
-        st.error(f"Error or No Data. Query: {sql}")
+        st.error(f"Execution Error. Query attempted: {sql}")
