@@ -1,115 +1,91 @@
 import streamlit as st
 import pandas as pd
-import duckdb
 import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
+# Using pandas as the engine if duckdb is unavailable in your environment
+import sqlite3 
 
-# --- 1. DATA ENGINE (Load exact headers) ---
+# --- 1. DATA ENGINE (Load and Clean) ---
 @st.cache_resource
 def load_data():
-    conn = duckdb.connect(database=':memory:')
+    # Use SQLite as a reliable fallback for local/Streamlit environments
+    conn = sqlite3.connect(':memory:', check_same_thread=False)
     
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
-        # Ensure date format and remove whitespace
-        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
-        conn.register("pnl_data", df_pnl)
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month']).dt.strftime('%Y-%m-%d')
+        df_pnl.to_sql("pnl_data", conn, index=False, if_exists='replace')
 
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
-        df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
-        conn.register("ut_data", df_ut)
+        df_ut['Date'] = pd.to_datetime(df_ut['Date']).dt.strftime('%Y-%m-%d')
+        df_ut.to_sql("ut_data", conn, index=False, if_exists='replace')
 
     return conn
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (v15.0) ---
+# --- 2. THE ANALYST ENGINE (v16.0) ---
 def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # STEP 1: Intent Classification
-    intent_prompt = f"Classify the user input as 'DATA' or 'CHAT'. Input: {user_query}. Output only the word."
-    intent = llm.invoke(intent_prompt).content.strip().upper()
-
+    # 1. Intent Classification
+    intent = llm.invoke(f"Classify as 'DATA' or 'CHAT': {user_query}").content.strip().upper()
     if 'CHAT' in intent:
-        chat_prompt = f"You are the L&T Executive Assistant. Briefly explain that you can calculate Revenue, Costs, C&B %, and Utilization across Segments and Customers. User: {user_query}"
-        return "CHAT", None, llm.invoke(chat_prompt).content
+        return "CHAT", None, llm.invoke(f"Greet user and say you are ready for L&T data analysis: {user_query}").content
 
-    # STEP 2: DATA PATH (Precise Logic)
+    # 2. SQL Path with CTE instructions for Margin
     system_prompt = """
-    You are an expert SQL generator for DuckDB.
+    You are an expert SQL generator. Use the following logic for L&T KPIs:
+
+    - REVENUE: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+    - TOTAL COST: SUM("Amount in USD") WHERE Type = 'Cost'
+    - MARGIN %: ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
+    - C&B COST: SUM("Amount in USD") WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
     
-    TABLE SCHEMA:
-    - pnl_data: [Month, FinalCustomerName, "Amount in USD", Type, Group1, Group3, Segment]
-    - ut_data: [Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours, Segment]
+    QUERY STRUCTURE RULE:
+    For Margin % or complex ratios, use a CTE (WITH clause) to calculate Revenue and Cost separately before joining them. 
+    This prevents 'blank' results when an account has missing data types.
 
-    DATA VALUE MAPPING (STRICT):
-    - C&B Cost: SUM("Amount in USD") WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
-    - Revenue: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
-    - Utilization %: (SUM(TotalBillableHours) / NULLIF(SUM(NetAvailableHours), 0)) * 100
-    - FTE / Headcount: COUNT(DISTINCT PSNo)
-
-    RULES:
-    1. If a query needs BOTH tables, join on FinalCustomerName AND Month (STRFTIME '%Y-%m').
-    2. Column Aliasing: Use descriptive names like CB_Cost, Revenue, Billable_Hours instead of generic 'Numerator'.
-    3. Always select columns in this order: [Dimension, Component_1, Component_2, Final_Result].
-    4. For dates like 'June 2025', use '2025-06-01'.
-
-    Return ONLY the SQL block.
+    OUTPUT COLUMNS: [Dimension, Component_1, Component_2, Final_Result]
     """
     
     response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
     sql = response.content.strip().replace("```sql", "").replace("```", "")
     
     try:
-        df = conn.execute(sql).df()
+        df = pd.read_sql_query(sql, conn)
         return "DATA", sql, df
     except Exception as e:
         return "ERROR", sql, str(e)
 
 # --- 3. UI LAYOUT ---
-st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v15.0")
-
-user_input = st.text_input("Enter your query (e.g., 'C&B cost as % of revenue by segment for June 2025')")
+st.title("🏛️ L&T Executive Analyst v16.0")
+user_input = st.text_input("Ask about Margin %, C&B, or Utilization:")
 
 if user_input:
     mode, sql, result = execute_ai_query(user_input)
     
     if mode == "CHAT":
         st.write(result)
-        
     elif mode == "DATA":
-        if isinstance(result, pd.DataFrame) and not result.empty:
+        if not result.empty:
             # 2-Point Insights
             avg_val = result.iloc[:, -1].mean()
-            max_val = result.iloc[:, -1].max()
-            st.info(f"💡 **Insights:** Period Average: **{avg_val:,.2f}** | Period Peak: **{max_val:,.2f}**")
+            max_row = result.loc[result.iloc[:, -1].idxmax()]
+            st.info(f"💡 **Insights:** Average: **{avg_val:,.2f}%** | Highest: **{max_row.iloc[0]}** (**{max_row.iloc[-1]:,.2f}%**)")
 
             tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
-            
             with tab1:
-                # Show key result column (last one) and dimension (first one)
-                display_df = result.iloc[:, [0, -1]]
-                st.dataframe(display_df, use_container_width=True)
-                
+                st.dataframe(result.iloc[:, [0, -1]], use_container_width=True)
                 if len(result) > 1:
                     fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.plot(result.iloc[:, 0].astype(str), result.iloc[:, -1], marker='o', color='#00529B', linewidth=2)
-                    plt.xticks(rotation=45)
+                    result.plot(kind='bar', x=result.columns[0], y=result.columns[-1], ax=ax, color='#00529B')
                     st.pyplot(fig)
-
             with tab2:
-                st.markdown("### 🔍 Calculation Audit")
-                st.write("This table shows the exact components used for the calculation:")
-                st.dataframe(result, use_container_width=True)
-                st.write("**Generated SQL Query:**")
+                st.write("**Full Component Breakdown:**")
+                st.dataframe(result)
                 st.code(sql, language="sql")
         else:
-            st.warning("No data found for this specific query. Please check filters like dates or names.")
-            
-    elif mode == "ERROR":
-        st.error(f"Execution Error: {result}")
-        st.code(sql)
+            st.warning("No data found. Try adjusting the account name or date.")
