@@ -1,16 +1,28 @@
-import streamlit as st
-import os
-import traceback
+# app.py
 
+import os
+import sys
+import streamlit as st
+import hashlib
+
+# -------------------------------------------------
+# Ensure repo root is on PYTHONPATH (CRITICAL FOR CLOUD)
+# -------------------------------------------------
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+# -------------------------------------------------
+# Imports (AFTER path fix)
+# -------------------------------------------------
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
 from agents.bi import BIAgent
 from agents.validator import ValidationAgent
 import config
 
-
 # -------------------------------------------------
-# App setup
+# Streamlit Page Config
 # -------------------------------------------------
 st.set_page_config(
     page_title="Metadata-Driven AI Analytics Platform",
@@ -20,106 +32,92 @@ st.set_page_config(
 st.title("🤖 Metadata-Driven AI Analytics Platform")
 st.subheader("Ask a business question")
 
-
 # -------------------------------------------------
-# Resolve BASE DIRECTORY (CRITICAL FIX)
+# File existence checks (FAIL FAST)
 # -------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KPI_PATH = "metadata/kpi_directory.xlsx"
+PROMPT_PATH = "prompts/architect_prompt.txt"
 
-KPI_DIRECTORY_PATH = os.path.join(BASE_DIR, "metadata", "kpi_directory.xlsx")
-FIELD_DIRECTORY_PATH = os.path.join(BASE_DIR, "metadata", "field_directory.xlsx")
-ARCHITECT_PROMPT_PATH = os.path.join(BASE_DIR, "prompts", "architect_prompt.txt")
+missing_files = []
+if not os.path.exists(KPI_PATH):
+    missing_files.append(KPI_PATH)
 
+if not os.path.exists(PROMPT_PATH):
+    missing_files.append(PROMPT_PATH)
+
+if missing_files:
+    st.error("❌ Required files missing:")
+    for f in missing_files:
+        st.code(f)
+    st.stop()
 
 # -------------------------------------------------
 # Initialize Agents (cached)
 # -------------------------------------------------
-@st.cache_resource
-def load_agents():
+@st.cache_resource(show_spinner=False)
+def init_agents():
     architect = ArchitectAgent(
-        kpi_directory_path=KPI_DIRECTORY_PATH,
-        prompt_path=ARCHITECT_PROMPT_PATH,
+        kpi_directory_path=KPI_PATH,
+        prompt_path=PROMPT_PATH,
         model=config.MODEL_NAME
     )
 
     analyst = AnalystAgent()
+    bi = BIAgent()
     validator = ValidationAgent()
-    bi_agent = BIAgent()
 
-    return architect, analyst, validator, bi_agent
+    return architect, analyst, bi, validator
 
 
-architect, analyst, validator, bi_agent = load_agents()
-
+architect, analyst, bi, validator = init_agents()
 
 # -------------------------------------------------
-# User input
+# User Input (NO EMPTY LABEL)
 # -------------------------------------------------
 user_query = st.text_input(
-    label="",
-    placeholder="e.g. give me fte by segment for june 2025"
+    label="Business Question",
+    placeholder="e.g. give me FTE by segment for June 2025",
+    label_visibility="collapsed"
 )
 
-
 # -------------------------------------------------
-# Main execution
+# Run Pipeline
 # -------------------------------------------------
 if user_query:
-    try:
-        # ---------------------------
-        # STEP 1: Architect Agent
-        # ---------------------------
-        architect_output = architect.run(user_query)
+    with st.spinner("Thinking..."):
 
-        if not architect_output or not architect_output.get("kpi_id"):
-            st.warning("Could not determine KPI.")
+        # Step 1: Architect
+        architecture = architect.route(user_query)
+
+        if not architecture:
+            st.warning("❌ Could not determine KPI.")
             st.stop()
 
-        # ---------------------------
-        # STEP 2: Analyst Agent
-        # ---------------------------
-        analysis_output = analyst.run(architect_output)
-
-        # ---------------------------
-        # STEP 3: Validator Agent
-        # ---------------------------
-        validation_result = validator.run(
-            analysis_output,
-            architect_output
-        )
-
-        if not validation_result.get("is_valid", True):
-            st.error("Validation failed.")
-            st.json(validation_result)
+        # Step 2: Validation
+        validation = validator.validate(architecture)
+        if not validation["is_valid"]:
+            st.error(validation["reason"])
             st.stop()
 
-        # ---------------------------
-        # STEP 4: BI Agent
-        # ---------------------------
-        bi_output = bi_agent.run(
-            analysis_output,
-            architect_output
-        )
+        # Step 3: Analysis
+        analysis_output = analyst.run(architecture)
 
-        # ---------------------------
-        # Render Outputs
-        # ---------------------------
-        if "table" in bi_output:
-            st.subheader("📊 Result Table")
-            st.dataframe(bi_output["table"])
+        # Step 4: BI Formatting
+        final_output = bi.render(analysis_output)
 
-        if "chart" in bi_output:
-            st.subheader("📈 Chart")
-            st.pyplot(bi_output["chart"])
+    # -------------------------------------------------
+    # Display Results
+    # -------------------------------------------------
+    st.success("✅ Query processed successfully")
 
-        if "insights" in bi_output:
-            st.subheader("🧠 Insights")
-            st.write(bi_output["insights"])
+    if "summary" in final_output:
+        st.markdown("### 📌 Summary")
+        st.write(final_output["summary"])
 
-    except Exception as e:
-        st.error("Something went wrong while processing your request.")
-        st.info("The issue has been logged. Please try rephrasing.")
+    if "table" in final_output:
+        st.markdown("### 📊 Data")
+        st.dataframe(final_output["table"])
 
-        # FULL DEBUG TRACE (visible in Streamlit logs)
-        print("❌ APP ERROR")
-        print(traceback.format_exc())
+    if "chart" in final_output:
+        st.markdown("### 📈 Chart")
+        st.plotly_chart(final_output["chart"], use_container_width=True)
