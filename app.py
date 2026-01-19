@@ -3,96 +3,116 @@ import pandas as pd
 import duckdb
 import os
 import re
+import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE ---
+# --- 1. DATA ENGINE (With Pre-Processing) ---
 @st.cache_resource
-def load_and_init():
+def initialize_engine():
     conn = duckdb.connect(database=':memory:')
-    # Load and force standard naming/types
+    # Load P&L
     pnl = pd.read_excel("pnl_data.xlsx")
     pnl['Month'] = pd.to_datetime(pnl['Month'])
+    # Ensure all column names are stripped of whitespace
+    pnl.columns = [c.strip() for c in pnl.columns]
     conn.register("pnl_data", pnl)
     
+    # Load UT
     ut = pd.read_excel("ut_data.xlsx")
     ut['Date'] = pd.to_datetime(ut['Date'])
+    ut.columns = [c.strip() for c in ut.columns]
     conn.register("ut_data", ut)
     
-    # Load Directories
-    f_dir = pd.read_excel("field_directory.xlsx")
-    k_dir = pd.read_excel("kpi_directory.xlsx")
-    return conn, f_dir, k_dir
+    # Load Directories as reference "Bibles"
+    field_dir = pd.read_excel("field_directory.xlsx").to_string()
+    kpi_dir = pd.read_excel("kpi_directory.xlsx").to_string()
+    return conn, field_dir, kpi_dir
 
-conn, df_fields, df_kpis = load_and_init()
+conn, FIELD_BIBLE, KPI_BIBLE = initialize_engine()
 
-# --- 2. THE CONTRACTOR PIPELINE ---
+# --- 2. THE IMPROVED ANALYST PIPELINE ---
 
-def run_contractor_query(user_query):
+def clean_sql_output(raw_text):
+    """Removes 'Certainly', 'To...', and markdown backticks."""
+    # Remove markdown blocks
+    clean = re.sub(r"```sql|```", "", raw_text).strip()
+    # Force start at the first SQL keyword
+    start_match = re.search(r"\b(WITH|SELECT)\b", clean, re.IGNORECASE)
+    if start_match:
+        clean = clean[start_match.start():]
+    return clean
+
+def run_agent_v26(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    
-    # STEP 1: THE ARCHITECT (Validates Fields & Formulas)
-    # Explicitly telling the AI to look for 'Segment'
-    architect_task = f"""
-    You are a Data Architect. Use these directories:
-    KPIs: {df_kpis.to_string()}
-    FIELDS: {df_fields.to_string()}
-    
-    Identify the following for the query: "{user_query}"
-    1. Table Name(s)
-    2. Column for Grouping (Check for 'Segment', 'FinalCustomerName', etc.)
-    3. Formula Logic: If Margin %, use ((Revenue - Cost)/Revenue)*100.
-    4. Filters: Identify 'Type' and 'Group1' requirements.
-    """
-    logic_plan = llm.invoke(architect_task).content
 
-    # STEP 2: THE ANALYST (SQL Generation with Mandatory CTE)
-    analyst_task = f"""
-    Based on this Logic: {logic_plan}
+    # AGENT 1: THE ARCHITECT (Logic & Field Selection)
+    architect_prompt = f"""
+    Use these Bibles:
+    FIELDS: {FIELD_BIBLE}
+    KPIs: {KPI_BIBLE}
     
-    Generate DuckDB SQL. You MUST follow these rules:
-    - Use the 'Month' column for dates in pnl_data.
-    - Use the 'Segment' column if the user mentions Industry, Vertical, or Segment.
-    - FOR RATIOS (Margin, C&B): You MUST use two CTEs (RevCTE and CostCTE) and JOIN them.
-    - FILTERING: If the user asks for "less than 30%", put the filter in the FINAL SELECT.
-    
-    MANDATORY STRUCTURE:
-    WITH Rev AS (SELECT {{Dim}}, SUM("Amount in USD") as r FROM pnl_data WHERE Type='Revenue' AND {{Filters}} GROUP BY 1),
-         Cost AS (SELECT {{Dim}}, SUM("Amount in USD") as c FROM pnl_data WHERE Type='Cost' GROUP BY 1)
-    SELECT Rev.{{Dim}}, ((Rev.r - Cost.c)/NULLIF(Rev.r, 0))*100 as Margin_Perc
-    FROM Rev LEFT JOIN Cost ON Rev.{{Dim}} = Cost.{{Dim}}
-    WHERE Margin_Perc < 30;
+    TASK: Identify logic for: "{user_query}"
+    RULES:
+    1. If query is about Industry/Vertical/Business Unit, you MUST use the column 'Segment'.
+    2. For Margin %, use logic: ((Revenue - Total_Cost) / Revenue) * 100.
     """
+    logic_plan = llm.invoke(architect_prompt).content
+
+    # AGENT 2: THE IMPROVED ANALYST (SQL Generation)
+    analyst_prompt = f"""
+    PLAN: {logic_plan}
     
-    sql_raw = llm.invoke(analyst_task).content
-    sql = re.sub(r"```sql|```", "", sql_raw).strip()
-    sql = re.sub(r"^.*?(WITH|SELECT)", r"\1", sql, flags=re.DOTALL | re.IGNORECASE)
+    Write DuckDB SQL. RULES:
+    1. NO CONVERSATION. Start immediately with 'WITH' or 'SELECT'.
+    2. Do NOT say 'To' or 'Certainly'. 
+    3. Use 'Month' for pnl_data dates (format: '2025-06-01').
+    4. For Margin % < 30:
+       - CTE 1 (Rev): SUM Amount WHERE Type='Revenue' AND Group1 IN ('ONSITE','OFFSHORE','INDIRECT REVENUE')
+       - CTE 2 (Cost): SUM Amount WHERE Type='Cost'
+       - Final SELECT: Join on Segment or FinalCustomerName and filter WHERE Margin_Perc < 30.
+    """
+    sql_response = llm.invoke(analyst_prompt).content
+    final_sql = clean_sql_output(sql_response)
 
     try:
-        df = conn.execute(sql).df()
-        return "SUCCESS", logic_plan, sql, df
+        df = conn.execute(final_sql).df()
+        return "SUCCESS", logic_plan, final_sql, df
     except Exception as e:
-        return "ERROR", logic_plan, sql, str(e)
+        return "ERROR", logic_plan, final_sql, str(e)
 
 # --- 3. UI DASHBOARD ---
-st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v25.0")
+st.set_page_config(layout="wide", page_title="L&T v26.0")
+st.title("🏛️ L&T Executive Analyst v26.0")
+st.caption("Improved Logic Isolation & Field Mapping")
 
-q = st.text_input("Query:", placeholder="e.g., Accounts with Margin % < 30 in June 2025")
+user_q = st.text_input("Ask a question (e.g., Segments with Margin % < 30 in Q2 2025):")
 
-if q:
-    status, logic, sql, result = run_contractor_query(q)
+if user_q:
+    status, logic, sql, result = run_agent_v26(user_q)
     
     if status == "SUCCESS":
-        st.subheader("Results")
-        st.dataframe(result, use_container_width=True)
-        
-        # AUDIT TAB
-        with st.expander("🔍 Auditor & Calculation Details"):
-            t1, t2 = st.tabs(["Logic Plan", "SQL Generated"])
+        st.subheader("📊 Results")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.dataframe(result, use_container_width=True)
+        with col2:
+            if not result.empty:
+                val_col = result.columns[-1]
+                fig, ax = plt.subplots(figsize=(8, 4))
+                result.plot(kind='barh', x=result.columns[0], y=val_col, ax=ax, color='#E63946')
+                st.pyplot(fig)
+
+        # TABBED AUDIT LOG (As requested)
+        st.markdown("---")
+        with st.expander("🧾 Open Calculation Audit Log"):
+            t1, t2, t3 = st.tabs(["Formula Logic", "SQL Query", "Raw Components"])
             with t1:
-                st.write(logic)
+                st.info(logic)
             with t2:
                 st.code(sql, language="sql")
+            with t3:
+                st.write("Numerator/Denominator Table:")
+                st.dataframe(result)
     else:
-        st.error(f"Error: {result}")
+        st.error(f"Execution Error: {result}")
         st.code(sql)
