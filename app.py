@@ -3,65 +3,68 @@ import pandas as pd
 import duckdb
 import os
 import re
-import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. THE BIBLE (Context Loading) ---
+# --- 1. DATA ENGINE ---
 @st.cache_resource
-def setup_system():
+def load_and_init():
     conn = duckdb.connect(database=':memory:')
-    # Load Tables
-    for f, t in [("pnl_data.xlsx", "pnl_data"), ("ut_data.xlsx", "ut_data")]:
-        df = pd.read_excel(f)
-        if 'Month' in df.columns: df['Month'] = pd.to_datetime(df['Month'])
-        if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date'])
-        conn.register(t, df)
+    # Load and force standard naming/types
+    pnl = pd.read_excel("pnl_data.xlsx")
+    pnl['Month'] = pd.to_datetime(pnl['Month'])
+    conn.register("pnl_data", pnl)
+    
+    ut = pd.read_excel("ut_data.xlsx")
+    ut['Date'] = pd.to_datetime(ut['Date'])
+    conn.register("ut_data", ut)
     
     # Load Directories
-    f_dir = pd.read_excel("field_directory.xlsx").to_string()
-    k_dir = pd.read_excel("kpi_directory.xlsx").to_string()
+    f_dir = pd.read_excel("field_directory.xlsx")
+    k_dir = pd.read_excel("kpi_directory.xlsx")
     return conn, f_dir, k_dir
 
-conn, FIELD_BIBLE, KPI_BIBLE = setup_system()
+conn, df_fields, df_kpis = load_and_init()
 
-# --- 2. THE MULTI-AGENT ANALYST ---
-def solve_query(user_query):
+# --- 2. THE CONTRACTOR PIPELINE ---
+
+def run_contractor_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
     
-    # AGENT 1: ARCHITECT (Mapping Formula & Fields)
-    architect_prompt = f"""
-    You are a Financial Architect. Use the following Bibles to define the logic.
-    FIELD BIBLE: {FIELD_BIBLE}
-    KPI BIBLE: {KPI_BIBLE}
+    # STEP 1: THE ARCHITECT (Validates Fields & Formulas)
+    # Explicitly telling the AI to look for 'Segment'
+    architect_task = f"""
+    You are a Data Architect. Use these directories:
+    KPIs: {df_kpis.to_string()}
+    FIELDS: {df_fields.to_string()}
     
-    USER QUERY: {user_query}
-    
-    TASK: Output the Formula, the Numerator filter, and the Denominator filter.
-    Example: Margin % = ((Rev - Cost)/Rev)*100. Rev: Group1 in (ONSITE, OFFSHORE). Cost: Type='Cost'.
+    Identify the following for the query: "{user_query}"
+    1. Table Name(s)
+    2. Column for Grouping (Check for 'Segment', 'FinalCustomerName', etc.)
+    3. Formula Logic: If Margin %, use ((Revenue - Cost)/Revenue)*100.
+    4. Filters: Identify 'Type' and 'Group1' requirements.
     """
-    logic_plan = llm.invoke(architect_prompt).content
+    logic_plan = llm.invoke(architect_task).content
 
-    # AGENT 2: ANALYST (Writing Clean SQL)
-    analyst_prompt = f"""
-    Logic Plan: {logic_plan}
+    # STEP 2: THE ANALYST (SQL Generation with Mandatory CTE)
+    analyst_task = f"""
+    Based on this Logic: {logic_plan}
     
-    Write a DuckDB SQL query using CTEs. 
-    1. Only output the SQL code. NO INTRO, NO EXPLANATION, NO "Certainly".
-    2. P&L date column is 'Month'. UT date column is 'Date'.
-    3. For June 2025, use: Month = '2025-06-01'
+    Generate DuckDB SQL. You MUST follow these rules:
+    - Use the 'Month' column for dates in pnl_data.
+    - Use the 'Segment' column if the user mentions Industry, Vertical, or Segment.
+    - FOR RATIOS (Margin, C&B): You MUST use two CTEs (RevCTE and CostCTE) and JOIN them.
+    - FILTERING: If the user asks for "less than 30%", put the filter in the FINAL SELECT.
     
-    STRICT TEMPLATE FOR RATIOS:
-    WITH 
-    Numerator AS (SELECT {{Dimension}}, SUM("Amount in USD") as n_val FROM pnl_data WHERE {{Filters}} GROUP BY 1),
-    Denominator AS (SELECT {{Dimension}}, SUM("Amount in USD") as d_val FROM pnl_data WHERE {{Filters}} GROUP BY 1)
-    SELECT n.{{Dimension}}, n.n_val as Numerator, d.d_val as Denominator, 
-    ((n.n_val - d.d_val)/NULLIF(n.n_val, 0))*100 as Result_Perc
-    FROM Numerator n JOIN Denominator d ON n.{{Dimension}} = d.{{Dimension}}
+    MANDATORY STRUCTURE:
+    WITH Rev AS (SELECT {{Dim}}, SUM("Amount in USD") as r FROM pnl_data WHERE Type='Revenue' AND {{Filters}} GROUP BY 1),
+         Cost AS (SELECT {{Dim}}, SUM("Amount in USD") as c FROM pnl_data WHERE Type='Cost' GROUP BY 1)
+    SELECT Rev.{{Dim}}, ((Rev.r - Cost.c)/NULLIF(Rev.r, 0))*100 as Margin_Perc
+    FROM Rev LEFT JOIN Cost ON Rev.{{Dim}} = Cost.{{Dim}}
+    WHERE Margin_Perc < 30;
     """
-    sql_raw = llm.invoke(analyst_prompt).content
-    # Clean SQL: Remove markdown and conversational noise
+    
+    sql_raw = llm.invoke(analyst_task).content
     sql = re.sub(r"```sql|```", "", sql_raw).strip()
-    # Remove any text before the first 'WITH' or 'SELECT'
     sql = re.sub(r"^.*?(WITH|SELECT)", r"\1", sql, flags=re.DOTALL | re.IGNORECASE)
 
     try:
@@ -70,40 +73,26 @@ def solve_query(user_query):
     except Exception as e:
         return "ERROR", logic_plan, sql, str(e)
 
-# --- 3. THE INTERFACE ---
+# --- 3. UI DASHBOARD ---
 st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v24.0")
+st.title("🏛️ L&T Executive Analyst v25.0")
 
-q = st.text_input("Run a complex query (e.g., Margin % by Account for June 2025):")
+q = st.text_input("Query:", placeholder="e.g., Accounts with Margin % < 30 in June 2025")
 
 if q:
-    status, logic, sql, df = solve_query(q)
+    status, logic, sql, result = run_contractor_query(q)
     
     if status == "SUCCESS":
-        st.subheader("📊 Results & Insights")
-        metric_col = df.columns[-1]
+        st.subheader("Results")
+        st.dataframe(result, use_container_width=True)
         
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.metric("Group Average", f"{df[metric_col].mean():,.2f}%")
-            st.dataframe(df, use_container_width=True)
-        with c2:
-            fig, ax = plt.subplots(figsize=(10, 5))
-            df.plot(kind='bar', x=df.columns[0], y=metric_col, ax=ax, color='#00529B')
-            st.pyplot(fig)
-            
-        # THE AUDIT TAB (Your Requirement)
-        st.markdown("---")
-        with st.expander("🧾 Auditor Log (Formula, SQL, & Components)"):
-            tab_f, tab_s, tab_c = st.tabs(["Formula Details", "Generated SQL", "Calculation Components"])
-            with tab_f:
-                st.write("**Architect Logic:**")
-                st.info(logic)
-            with tab_s:
+        # AUDIT TAB
+        with st.expander("🔍 Auditor & Calculation Details"):
+            t1, t2 = st.tabs(["Logic Plan", "SQL Generated"])
+            with t1:
+                st.write(logic)
+            with t2:
                 st.code(sql, language="sql")
-            with tab_c:
-                st.write("Raw data used for Numerator and Denominator:")
-                st.dataframe(df)
     else:
-        st.error(f"Execution Error: {df}")
+        st.error(f"Error: {result}")
         st.code(sql)
