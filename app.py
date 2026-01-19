@@ -19,6 +19,37 @@ st.set_page_config(
 st.title("🤖 Metadata-Driven AI Analytics Platform")
 
 # -------------------------------------------------
+# Conversation Memory Helpers
+# -------------------------------------------------
+def get_last_intent():
+    return st.session_state.get("last_intent")
+
+
+def save_intent(intent):
+    st.session_state["last_intent"] = intent
+
+
+def merge_with_memory(new_intent, last_intent):
+    """
+    Merge new intent with previous intent.
+    Rules:
+    - New values override old ones
+    - Missing values inherit from memory
+    """
+    if not last_intent:
+        return new_intent
+
+    merged = {
+        "kpi_id": new_intent.get("kpi_id") or last_intent.get("kpi_id"),
+        "filters": last_intent.get("filters", {}).copy(),
+        "comparison": new_intent.get("comparison") or last_intent.get("comparison"),
+    }
+
+    merged["filters"].update(new_intent.get("filters", {}))
+    return merged
+
+
+# -------------------------------------------------
 # Load Data into DuckDB
 # -------------------------------------------------
 @st.cache_resource
@@ -58,7 +89,17 @@ bi = BIAgent()
 validator = ValidationAgent()
 
 # -------------------------------------------------
-# UI
+# Sidebar: Current Context (Conversation Memory)
+# -------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🧠 Current Context")
+    if get_last_intent():
+        st.json(get_last_intent())
+    else:
+        st.write("No active context yet")
+
+# -------------------------------------------------
+# Main UI
 # -------------------------------------------------
 st.markdown("### Ask a business question")
 user_query = st.text_input(
@@ -69,17 +110,24 @@ user_query = st.text_input(
 if user_query:
 
     # ---------------------------------------------
-    # 1. ARCHITECT AGENT
+    # 1. ARCHITECT AGENT (NL → Partial Intent)
     # ---------------------------------------------
     with st.spinner("🧠 Understanding your question..."):
-        intent = architect.run(user_query)
+        raw_intent = architect.run(user_query)
+
+    # ---------------------------------------------
+    # 2. MERGE WITH CONVERSATION MEMORY
+    # ---------------------------------------------
+    last_intent = get_last_intent()
+    intent = merge_with_memory(raw_intent, last_intent)
+    save_intent(intent)
 
     if not intent or not intent.get("kpi_id"):
-        st.warning("Could not determine KPI. Please rephrase your question.")
+        st.warning("Could not determine KPI. Please rephrase.")
         st.stop()
 
     # ---------------------------------------------
-    # 2. ANALYST AGENT (SQL GENERATION)
+    # 3. ANALYST AGENT (SQL GENERATION)
     # ---------------------------------------------
     with st.spinner("📊 Generating SQL..."):
         sql = analyst.generate_sql(
@@ -89,7 +137,7 @@ if user_query:
         )
 
     # ---------------------------------------------
-    # 3. SQL EXECUTION
+    # 4. SQL EXECUTION
     # ---------------------------------------------
     try:
         df = conn.execute(sql).df()
@@ -105,7 +153,7 @@ if user_query:
         st.stop()
 
     # ---------------------------------------------
-    # 4. VALIDATION AGENT
+    # 5. VALIDATION AGENT
     # ---------------------------------------------
     warnings, errors = validator.validate(
         kpi_id=intent["kpi_id"],
@@ -130,7 +178,7 @@ if user_query:
             st.warning(warn)
 
     # ---------------------------------------------
-    # 5. BI AGENT (VISUALS + INSIGHTS)
+    # 6. BI AGENT (VISUALS + INSIGHTS)
     # ---------------------------------------------
     with st.spinner("📈 Building visuals and insights..."):
         bi.render(
@@ -140,7 +188,7 @@ if user_query:
         )
 
     # ---------------------------------------------
-    # DEBUG / AUDIT SECTION
+    # 7. SQL & DATA AUDIT
     # ---------------------------------------------
     with st.expander("🔍 SQL Audit & Raw Output"):
         st.code(sql, language="sql")
