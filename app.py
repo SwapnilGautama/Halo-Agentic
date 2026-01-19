@@ -5,7 +5,7 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (v15 Stable Foundation) ---
+# --- 1. DATA ENGINE (v15 Base) ---
 @st.cache_resource
 def load_data():
     conn = duckdb.connect(database=':memory:')
@@ -21,32 +21,32 @@ def load_data():
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (v17.0) ---
+# --- 2. THE ANALYST ENGINE (v18.0) ---
 def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # 1. Intent Gatekeeper
-    intent = llm.invoke(f"Classify as 'DATA' or 'CHAT'. User: {user_query}").content.strip().upper()
+    # Intent Classification
+    intent = llm.invoke(f"Return only 'DATA' or 'CHAT' for: {user_query}").content.strip().upper()
     if 'CHAT' in intent:
-        return "CHAT", None, llm.invoke(f"Greet user as L&T Assistant: {user_query}").content
+        return "CHAT", None, llm.invoke(f"Greet the user as their L&T Financial Assistant: {user_query}").content
 
-    # 2. SQL Path with Precise Formula Mapping
+    # SQL Generation Logic
     system_prompt = """
-    You are a Financial SQL expert for DuckDB. 
+    You are a SQL expert for DuckDB.
     
-    METRIC DEFINITIONS:
-    - Revenue: SUM("Amount in USD") FILTER (WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))
-    - Total_Cost: SUM("Amount in USD") FILTER (WHERE Type = 'Cost')
-    - Margin_Perc: ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
-    - C&B_Cost: SUM("Amount in USD") FILTER (WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost')
-    - FTE: COUNT(DISTINCT PSNo)
+    FORMULA RULES (STRICT):
+    - Revenue = SUM(CASE WHEN Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE') THEN "Amount in USD" ELSE 0 END)
+    - Total_Cost = SUM(CASE WHEN Type = 'Cost' THEN "Amount in USD" ELSE 0 END)
+    - CB_Cost = SUM(CASE WHEN Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost' THEN "Amount in USD" ELSE 0 END)
+    - Margin_Perc = ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
+    - CB_Perc = (CB_Cost / NULLIF(Revenue, 0)) * 100
 
-    COLUMN NAMING RULE:
-    Always name the columns exactly as [Dimension, Component_1, Component_2, Final_Result].
-    For Margin questions, Component_1 must be 'Revenue' and Component_2 must be 'Total_Cost'.
-
-    DATE RULE:
-    June 2025 is '2025-06-01'. Use STRFTIME(Month, '%Y-%m') for comparisons.
+    QUERY INSTRUCTIONS:
+    - Use the pnl_data table.
+    - Segment is 'Segment', Account is 'FinalCustomerName', Month is 'Month'.
+    - For 'June 2025', filter using: Month = '2025-06-01'.
+    - Always provide 4 columns: [Dimension (Segment/Account), Component_1, Component_2, Final_Result].
+    - Use clear names: 'Revenue', 'Total_Cost', 'CB_Cost', 'Margin_Perc', 'CB_Ratio'.
     """
     
     response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
@@ -60,9 +60,9 @@ def execute_ai_query(user_query):
 
 # --- 3. UI LAYOUT ---
 st.set_page_config(layout="wide")
-st.title("🏛️ L&T Executive Analyst v17.0")
+st.title("🏛️ L&T Executive Analyst v18.0")
 
-user_input = st.text_input("Ask about Margin, C&B %, FTE, or Utilization:")
+user_input = st.text_input("Query (e.g., 'Margin % by account for June 2025' or 'C&B cost as % of revenue by segment')")
 
 if user_input:
     mode, sql, result = execute_ai_query(user_input)
@@ -71,14 +71,15 @@ if user_input:
         st.write(result)
     elif mode == "DATA":
         if not result.empty:
-            # Executive Insights
+            # 2-Point Insights
             last_col = result.columns[-1]
             avg_val = result[last_col].mean()
-            st.info(f"💡 **Executive Summary:** Average {last_col} is **{avg_val:,.2f}**")
+            max_val = result[last_col].max()
+            st.info(f"💡 **Executive Summary:** Average {last_col}: **{avg_val:,.2f}** | Peak {last_col}: **{max_val:,.2f}**")
 
             tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
             with tab1:
-                # Show main result
+                # Main display: First and Last column
                 st.dataframe(result.iloc[:, [0, -1]], use_container_width=True)
                 if len(result) > 1:
                     fig, ax = plt.subplots(figsize=(10, 3))
@@ -86,11 +87,11 @@ if user_input:
                     plt.xticks(rotation=45)
                     st.pyplot(fig)
             with tab2:
-                st.markdown("### Audit Trail")
-                st.write("Full breakdown of components used:")
-                st.dataframe(result, use_container_width=True)
+                st.markdown("### 🔍 Calculation Audit")
+                st.write("Components used in this calculation:")
+                st.dataframe(result, use_container_width=True) # Shows actual names like Revenue/Total_Cost
                 st.code(sql, language="sql")
         else:
-            st.warning("Query returned no results. Check if the Customer/Segment name is spelled correctly.")
+            st.warning("No data found. Please verify the month or account name.")
     elif mode == "ERROR":
-        st.error(f"SQL Error: {result}")
+        st.error(f"SQL Execution Error: {result}")
