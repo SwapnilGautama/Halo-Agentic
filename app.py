@@ -1,68 +1,68 @@
 import streamlit as st
 import pandas as pd
+import duckdb
 import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
-# Using pandas as the engine if duckdb is unavailable in your environment
-import sqlite3 
 
-# --- 1. DATA ENGINE (Load and Clean) ---
+# --- 1. DATA ENGINE (v15 Stable Foundation) ---
 @st.cache_resource
 def load_data():
-    # Use SQLite as a reliable fallback for local/Streamlit environments
-    conn = sqlite3.connect(':memory:', check_same_thread=False)
-    
+    conn = duckdb.connect(database=':memory:')
     if os.path.exists("pnl_data.xlsx"):
         df_pnl = pd.read_excel("pnl_data.xlsx")
-        df_pnl['Month'] = pd.to_datetime(df_pnl['Month']).dt.strftime('%Y-%m-%d')
-        df_pnl.to_sql("pnl_data", conn, index=False, if_exists='replace')
-
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
+        conn.register("pnl_data", df_pnl)
     if os.path.exists("ut_data.xlsx"):
         df_ut = pd.read_excel("ut_data.xlsx")
-        df_ut['Date'] = pd.to_datetime(df_ut['Date']).dt.strftime('%Y-%m-%d')
-        df_ut.to_sql("ut_data", conn, index=False, if_exists='replace')
-
+        df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
+        conn.register("ut_data", df_ut)
     return conn
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (v16.0) ---
+# --- 2. THE ANALYST ENGINE (v17.0) ---
 def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # 1. Intent Classification
-    intent = llm.invoke(f"Classify as 'DATA' or 'CHAT': {user_query}").content.strip().upper()
+    # 1. Intent Gatekeeper
+    intent = llm.invoke(f"Classify as 'DATA' or 'CHAT'. User: {user_query}").content.strip().upper()
     if 'CHAT' in intent:
-        return "CHAT", None, llm.invoke(f"Greet user and say you are ready for L&T data analysis: {user_query}").content
+        return "CHAT", None, llm.invoke(f"Greet user as L&T Assistant: {user_query}").content
 
-    # 2. SQL Path with CTE instructions for Margin
+    # 2. SQL Path with Precise Formula Mapping
     system_prompt = """
-    You are an expert SQL generator. Use the following logic for L&T KPIs:
-
-    - REVENUE: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
-    - TOTAL COST: SUM("Amount in USD") WHERE Type = 'Cost'
-    - MARGIN %: ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
-    - C&B COST: SUM("Amount in USD") WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
+    You are a Financial SQL expert for DuckDB. 
     
-    QUERY STRUCTURE RULE:
-    For Margin % or complex ratios, use a CTE (WITH clause) to calculate Revenue and Cost separately before joining them. 
-    This prevents 'blank' results when an account has missing data types.
+    METRIC DEFINITIONS:
+    - Revenue: SUM("Amount in USD") FILTER (WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE'))
+    - Total_Cost: SUM("Amount in USD") FILTER (WHERE Type = 'Cost')
+    - Margin_Perc: ((Revenue - Total_Cost) / NULLIF(Revenue, 0)) * 100
+    - C&B_Cost: SUM("Amount in USD") FILTER (WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost')
+    - FTE: COUNT(DISTINCT PSNo)
 
-    OUTPUT COLUMNS: [Dimension, Component_1, Component_2, Final_Result]
+    COLUMN NAMING RULE:
+    Always name the columns exactly as [Dimension, Component_1, Component_2, Final_Result].
+    For Margin questions, Component_1 must be 'Revenue' and Component_2 must be 'Total_Cost'.
+
+    DATE RULE:
+    June 2025 is '2025-06-01'. Use STRFTIME(Month, '%Y-%m') for comparisons.
     """
     
     response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
     sql = response.content.strip().replace("```sql", "").replace("```", "")
     
     try:
-        df = pd.read_sql_query(sql, conn)
+        df = conn.execute(sql).df()
         return "DATA", sql, df
     except Exception as e:
         return "ERROR", sql, str(e)
 
 # --- 3. UI LAYOUT ---
-st.title("🏛️ L&T Executive Analyst v16.0")
-user_input = st.text_input("Ask about Margin %, C&B, or Utilization:")
+st.set_page_config(layout="wide")
+st.title("🏛️ L&T Executive Analyst v17.0")
+
+user_input = st.text_input("Ask about Margin, C&B %, FTE, or Utilization:")
 
 if user_input:
     mode, sql, result = execute_ai_query(user_input)
@@ -71,21 +71,26 @@ if user_input:
         st.write(result)
     elif mode == "DATA":
         if not result.empty:
-            # 2-Point Insights
-            avg_val = result.iloc[:, -1].mean()
-            max_row = result.loc[result.iloc[:, -1].idxmax()]
-            st.info(f"💡 **Insights:** Average: **{avg_val:,.2f}%** | Highest: **{max_row.iloc[0]}** (**{max_row.iloc[-1]:,.2f}%**)")
+            # Executive Insights
+            last_col = result.columns[-1]
+            avg_val = result[last_col].mean()
+            st.info(f"💡 **Executive Summary:** Average {last_col} is **{avg_val:,.2f}**")
 
             tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
             with tab1:
+                # Show main result
                 st.dataframe(result.iloc[:, [0, -1]], use_container_width=True)
                 if len(result) > 1:
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    result.plot(kind='bar', x=result.columns[0], y=result.columns[-1], ax=ax, color='#00529B')
+                    fig, ax = plt.subplots(figsize=(10, 3))
+                    ax.bar(result.iloc[:, 0].astype(str), result.iloc[:, -1], color='#00529B')
+                    plt.xticks(rotation=45)
                     st.pyplot(fig)
             with tab2:
-                st.write("**Full Component Breakdown:**")
-                st.dataframe(result)
+                st.markdown("### Audit Trail")
+                st.write("Full breakdown of components used:")
+                st.dataframe(result, use_container_width=True)
                 st.code(sql, language="sql")
         else:
-            st.warning("No data found. Try adjusting the account name or date.")
+            st.warning("Query returned no results. Check if the Customer/Segment name is spelled correctly.")
+    elif mode == "ERROR":
+        st.error(f"SQL Error: {result}")
