@@ -29,43 +29,21 @@ If a KPI cannot be confidently mapped using the directory, return:
 
 If a filter is not mentioned, do NOT guess it.
 
-KPI DIRECTORY:
+-----------------------
+KPI DIRECTORY
+-----------------------
 {{KPI_DIRECTORY}}
 
-OUTPUT FORMAT (JSON ONLY — NO EXTRA TEXT):
+-----------------------
+USER QUESTION
+-----------------------
+{{USER_QUESTION}}
+
+-----------------------
+OUTPUT FORMAT (JSON ONLY — NO EXTRA TEXT)
+-----------------------
 {
   "kpi_id": string | null,
   "filters": { string: string },
   "comparison": "MoM" | "QoQ" | null
-}
-
-Examples:
-
-User: give me headcount by segment for june 2025
-Output:
-{
-  "kpi_id": "KPI_016",
-  "filters": {
-    "Month": "2025-06-01"
-  },
-  "comparison": null
-}
-
-User: why did margin drop last month in transportation
-Output:
-{
-  "kpi_id": "KPI_006",
-  "filters": {
-    "Segment": "Transportation",
-    "Month": "2025-06-01"
-  },
-  "comparison": "MoM"
-}
-
-User: show fte trend qoq
-Output:
-{
-  "kpi_id": "KPI_019",
-  "filters": {},
-  "comparison": "QoQ"
 }
