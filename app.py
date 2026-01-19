@@ -25,43 +25,78 @@ def load_data():
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (v15 + Ratio Logic Fix) ---
+# --- 2. THE ANALYST ENGINE (v15 + HARD-CODED MARGIN LOGIC) ---
+
+def clean_sql(raw_sql):
+    """Protects against 'Certainly', 'To', and conversational leaks"""
+    clean = re.sub(r"```sql|```", "", raw_sql).strip()
+    match = re.search(r"\b(WITH|SELECT)\b", clean, re.IGNORECASE)
+    if match:
+        return clean[match.start():]
+    return clean
+
 def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # Classification (Preserving v15 Intent)
-    intent_prompt = f"Classify as 'DATA' or 'CHAT'. User: {user_query}. Output one word."
+    # Classification
+    intent_prompt = f"Classify as 'DATA' or 'CHAT'. Input: {user_query}. Output one word."
     intent = llm.invoke(intent_prompt).content.strip().upper()
 
     if "CHAT" in intent:
         return "CHAT", None, llm.invoke(user_query).content
 
-    # The Bible Context for the AI
-    system_rules = """
-    You are a Financial SQL expert. 
-    TABLE: pnl_data (Columns: Month, Segment, FinalCustomerName, Amount in USD, Type, Group1)
-    TABLE: ut_data (Columns: Date, PSNo, Segment, TotalBillableHours, NetAvailableHours)
-
-    CRITICAL RATIO RULES:
-    1. For 'Margin %' or 'Contribution Margin', you MUST use this bucket logic:
-       WITH Rev AS (SELECT {Dim}, SUM("Amount in USD") as r FROM pnl_data WHERE Type='Revenue' AND Group1 IN ('ONSITE','OFFSHORE','INDIRECT REVENUE') GROUP BY 1),
-            Cost AS (SELECT {Dim}, SUM("Amount in USD") as c FROM pnl_data WHERE Type='Cost' GROUP BY 1)
-       SELECT Rev.{Dim}, Rev.r as Revenue, Cost.c as Cost, ((Rev.r - Cost.c)/NULLIF(Rev.r, 0))*100 as Margin_Perc
-       FROM Rev LEFT JOIN Cost ON Rev.{Dim} = Cost.{Dim}
+    # --- SPECIAL MARGIN LOGIC BLOCK ---
+    is_margin_query = any(x in user_query.lower() for x in ["margin", "cm%", "profit", "cm %"])
     
-    2. If the user asks for 'Segment', use the [Segment] column.
-    3. Output ONLY the SQL code. Start with 'WITH' or 'SELECT'.
-    """
+    if is_margin_query:
+        # We use the LLM ONLY to extract parameters, not to write the structure
+        param_prompt = f"""
+        User Query: {user_query}
+        Identify:
+        1. Dimension: 'Segment' (for Industry/Vertical) or 'FinalCustomerName' (for Accounts). Default: 'FinalCustomerName'.
+        2. Date Filter: DuckDB SQL where clause for 'Month' column (e.g., Month = '2025-06-01').
+        3. Threshold: Numeric value for filtering (e.g., 30 for < 30%). Default: None.
+        Output format: Dimension | DateFilter | Threshold
+        """
+        params = llm.invoke(param_prompt).content.strip().split("|")
+        dim = params[0].strip() if len(params) > 0 else "FinalCustomerName"
+        date_filt = params[1].strip() if len(params) > 1 else "1=1"
+        threshold = params[2].strip() if len(params) > 2 and "None" not in params[2] else ""
 
-    response = llm.invoke(f"{system_rules}\n\nQuestion: {user_query}")
-    sql_raw = response.content.replace("```sql", "").replace("```", "").strip()
-    
-    # SHIELD: Remove "Certainly", "To", or any text before the SQL starts
-    sql_match = re.search(r"\b(WITH|SELECT)\b", sql_raw, re.IGNORECASE)
-    if sql_match:
-        sql = sql_raw[sql_match.start():]
+        # Use the PROVEN SQL Template
+        sql = f"""
+        WITH Rev AS (
+            SELECT "{dim}", SUM("Amount in USD") as r_val 
+            FROM pnl_data 
+            WHERE Type = 'Revenue' AND Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE') AND {date_filt}
+            GROUP BY 1
+        ),
+        Cost AS (
+            SELECT "{dim}", SUM("Amount in USD") as c_val 
+            FROM pnl_data 
+            WHERE Type = 'Cost' AND {date_filt}
+            GROUP BY 1
+        )
+        SELECT 
+            Rev."{dim}", 
+            Rev.r_val as Revenue, 
+            COALESCE(Cost.c_val, 0) as Total_Cost, 
+            ((Rev.r_val - COALESCE(Cost.c_val, 0)) / NULLIF(Rev.r_val, 0)) * 100 as Margin_Perc
+        FROM Rev 
+        LEFT JOIN Cost ON Rev."{dim}" = Cost."{dim}"
+        {f"WHERE ((Rev.r_val - COALESCE(Cost.c_val, 0)) / NULLIF(Rev.r_val, 0)) * 100 < {threshold}" if threshold else ""}
+        ORDER BY Margin_Perc ASC;
+        """
     else:
-        sql = sql_raw
+        # Standard v15 Logic for FTE, Revenue alone, etc.
+        system_rules = """
+        Use pnl_data (Month, Segment, FinalCustomerName, Amount in USD, Type, Group1) 
+        or ut_data (Date, PSNo, Segment, TotalBillableHours).
+        If FTE, use COUNT(DISTINCT PSNo).
+        Output ONLY SQL.
+        """
+        response = llm.invoke(f"{system_rules}\n\nQuestion: {user_query}")
+        sql = clean_sql(response.content)
 
     try:
         df = conn.execute(sql).df()
@@ -69,11 +104,11 @@ def execute_ai_query(user_query):
     except Exception as e:
         return "ERROR", sql, str(e)
 
-# --- 3. UI (v15 Preserved Layout) ---
+# --- 3. UI (v15 Preserved) ---
 st.set_page_config(layout="wide")
-st.title("🏛️ L&T Analyst v15.1 (Fixed)")
+st.title("🏛️ L&T Analyst v15.2 (Surgical Fix)")
 
-user_input = st.text_input("Analyze P&L (Margin, Revenue, Cost) or UT (FTE, Utilization):")
+user_input = st.text_input("Ask about Margin %, FTE, or Revenue:")
 
 if user_input:
     mode, sql, result = execute_ai_query(user_input)
@@ -82,27 +117,26 @@ if user_input:
         st.write(result)
     elif mode == "DATA":
         if not result.empty:
-            # Insights
             avg_val = result.iloc[:, -1].mean()
-            st.info(f"💡 **Analysis Result:** Average across selected items: **{avg_val:,.2f}**")
+            st.info(f"💡 **Analysis Result:** Average: **{avg_val:,.2f}**")
 
             tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Audit"])
-            
             with tab1:
-                # Show Segment/Account and the final metric
                 st.dataframe(result, use_container_width=True)
                 if len(result) > 1:
                     fig, ax = plt.subplots(figsize=(10, 4))
                     ax.bar(result.iloc[:, 0].astype(str), result.iloc[:, -1], color='#00529B')
                     plt.xticks(rotation=45)
                     st.pyplot(fig)
-
             with tab2:
+                st.markdown("### 🔍 Calculation Audit")
+                st.write("**Formula Used:** ((Revenue - Total_Cost) / Revenue) * 100")
+                st.write("**Generated SQL:**")
                 st.code(sql, language="sql")
-                st.write("Full Component Data:")
+                st.write("**Raw Component Data:**")
                 st.dataframe(result)
         else:
-            st.warning("No records matched your criteria.")
+            st.warning("No data found for this specific query.")
     else:
-        st.error(f"SQL Error: {result}")
+        st.error(f"Execution Error: {result}")
         st.code(sql)
