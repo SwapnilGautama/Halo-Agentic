@@ -5,140 +5,107 @@ import os
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (Robust DuckDB Foundation) ---
+# --- 1. CORE DATA ENGINE ---
 @st.cache_resource
-def load_and_configure_db():
+def initialize_system():
     conn = duckdb.connect(database=':memory:')
-    
-    # Load P&L Data
+    # Load and clean P&L
     if os.path.exists("pnl_data.xlsx"):
         pnl = pd.read_excel("pnl_data.xlsx")
         pnl['Month'] = pd.to_datetime(pnl['Month'])
         conn.register("pnl_data", pnl)
-        
-    # Load Utilization Data
+    # Load and clean UT
     if os.path.exists("ut_data.xlsx"):
         ut = pd.read_excel("ut_data.xlsx")
         ut['Date'] = pd.to_datetime(ut['Date'])
         conn.register("ut_data", ut)
-
-    # Load Directories for AI Context
-    field_dir = pd.read_excel("field_directory.xlsx").to_string()
-    kpi_dir = pd.read_excel("kpi_directory.xlsx").to_string()
     
+    # Load Directories as reference "Bibles"
+    field_dir = pd.read_excel("field_directory.xlsx")
+    kpi_dir = pd.read_excel("kpi_directory.xlsx")
     return conn, field_dir, kpi_dir
 
-conn, FIELD_CONTEXT, KPI_CONTEXT = load_and_configure_db()
+conn, df_fields, df_kpis = initialize_system()
 
-# --- 2. THE MULTI-AGENT FACTORY ---
-def execute_complex_analyst(user_query):
+# --- 2. THE AUDITED ANALYST (v22.0) ---
+def run_audited_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # STAGE 1: INTENT & MAPPING
-    # This ensures the AI knows which columns to use based on your Field Directory
-    mapping_prompt = f"""
-    Reference these directories:
-    FIELDS: {FIELD_CONTEXT}
-    KPIs: {KPI_CONTEXT}
-    
-    User Query: {user_query}
-    
-    Task: Identify if this requires a Ratio (Margin, C&B%, UT%) or a Sum. 
-    If Ratio, identify the Numerator Group and Denominator Group.
-    """
-    
-    # STAGE 2: THE SQL ARCHITECT (Multi-Pass CTE Generation)
-    # This is the "Comprehensive Fix" - it forces the AI to use the CTE pattern
-    architect_prompt = """
-    You are a Senior Financial SQL Architect for DuckDB.
-    
-    CRITICAL RULE: To calculate ratios (Margin %, C&B %, UT %), you MUST use the following CTE pattern:
-    
-    WITH 
-    Numerator AS (
-        SELECT {Dimension}, SUM("Amount in USD") as num_val 
-        FROM pnl_data WHERE {Numerator_Filters} GROUP BY 1
-    ),
-    Denominator AS (
-        SELECT {Dimension}, SUM("Amount in USD") as den_val 
-        FROM pnl_data WHERE {Denominator_Filters} GROUP BY 1
-    )
-    SELECT 
-        n.{Dimension}, 
-        n.num_val as Component_1, 
-        d.den_val as Component_2, 
-        ((n.num_val - d.den_val)/NULLIF(n.num_val, 0))*100 as Final_Result
-    FROM Numerator n
-    JOIN Denominator d ON n.{Dimension} = d.{Dimension}
-    
-    MAPPINGS FROM DIRECTORY:
-    - Revenue: Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
-    - Total Cost: Type = 'Cost'
-    - C&B Cost: Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore')
-    - Utilization: Use ut_data table (TotalBillableHours / NetAvailableHours)
-    """
+    # Convert directories to string context for the AI
+    kpi_context = df_kpis.to_string()
+    field_context = df_fields.to_string()
 
-    full_prompt = f"{architect_prompt}\n\nContext:\n{mapping_prompt}\n\nGenerate ONLY the SQL."
-    response = llm.invoke(full_prompt)
-    sql = response.content.strip().replace("```sql", "").replace("```", "")
+    system_prompt = f"""
+    You are a Financial Data Auditor. Your task is to generate DuckDB SQL based STRICTLY on the provided KPI Directory.
+    
+    KPI DIRECTORY:
+    {kpi_context}
+    
+    FIELD MAPPING:
+    {field_context}
+
+    STRICT FORMULA RULES:
+    1. MARGIN %: You must calculate ((Revenue - Total_Cost) / Revenue) * 100.
+       - Revenue: Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+       - Total Cost: Type = 'Cost'
+    2. C&B %: You must calculate (CB_Cost / Revenue) * 100.
+       - CB_Cost: Group3 IN ('C&B - Onsite Total', 'C&B - Offshore Total') AND Type = 'Cost'
+    3. UTILIZATION %: (SUM(TotalBillableHours) / SUM(NetAvailableHours)) * 100 from ut_data.
+
+    SQL STRUCTURE REQUIREMENT:
+    Always use Common Table Expressions (CTEs) to separate Numerator and Denominator logic.
+    Example for Margin:
+    WITH Rev AS (SELECT Segment, SUM("Amount in USD") as r FROM pnl_data WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE') GROUP BY 1),
+         Cost AS (SELECT Segment, SUM("Amount in USD") as c FROM pnl_data WHERE Type = 'Cost' GROUP BY 1)
+    SELECT Rev.Segment, Rev.r as Revenue, Cost.c as Total_Cost, ((Rev.r - Cost.c)/NULLIF(Rev.r, 0))*100 as Margin_Perc
+    FROM Rev LEFT JOIN Cost ON Rev.Segment = Cost.Segment;
+    """
 
     try:
+        response = llm.invoke(system_prompt + f"\n\nUser Question: {user_query}")
+        sql = response.content.strip().replace("```sql", "").replace("```", "")
         df = conn.execute(sql).df()
         return "SUCCESS", sql, df
     except Exception as e:
         return "ERROR", sql, str(e)
 
-# --- 3. UI LAYOUT (High-Density Dashboard) ---
-st.set_page_config(layout="wide", page_title="L&T Financial Analyst")
+# --- 3. UI LAYOUT ---
+st.set_page_config(layout="wide")
+st.title("🏛️ L&T Audited Analyst v22.0")
+st.info("Verified against KPI & Field Directories")
 
-st.title("🏛️ L&T Executive Analyst v21.0")
-st.markdown("---")
+# Display the questions from your list for easy access
+st.sidebar.markdown("### 📋 Targeted Question List")
+target_questions = [
+    "Margin % by Account for June 2025",
+    "C&B cost as % of revenue by Segment",
+    "Utilization % by Exec DG",
+    "FTE Count by Segment for June",
+    "Top 5 Accounts by Revenue"
+]
+for tq in target_questions:
+    if st.sidebar.button(tq):
+        st.session_state.query = tq
 
-# Question Sidebar (Handling your list of questions)
-with st.sidebar:
-    st.header("Suggested Queries")
-    sample_queries = [
-        "Margin % by Account for June 2025",
-        "C&B cost as % of revenue by Segment",
-        "Utilization % by Exec DG for June",
-        "Top 10 Customers by Revenue",
-        "FTE Count by Segment"
-    ]
-    for q in sample_queries:
-        if st.button(q):
-            st.session_state.current_query = q
+user_input = st.text_input("Ask a question:", key="query")
 
-query_input = st.text_input("Analyze your data:", key="current_query")
-
-if query_input:
-    status, sql, result = execute_complex_analyst(query_input)
+if user_input:
+    status, sql, result = run_audited_query(user_input)
     
     if status == "SUCCESS":
-        # Metric Row
-        res_col = result.columns[-1]
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Average", f"{result[res_col].mean():,.2f}")
-        m2.metric("Maximum", f"{result[res_col].max():,.2f}")
-        m3.metric("Minimum", f"{result[res_col].min():,.2f}")
-
-        # Data & Viz Tabs
-        tab1, tab2, tab3 = st.tabs(["📊 Performance Chart", "🧾 Data Table", "🛠️ SQL Architect Log"])
+        st.subheader("Results")
+        # Insight Header
+        metric_col = result.columns[-1]
+        st.metric(label=f"Avg {metric_col}", value=f"{result[metric_col].mean():,.2f}")
         
+        tab1, tab2 = st.tabs(["📊 Visualization", "🔍 Auditor's SQL"])
         with tab1:
-            if len(result) > 1:
-                fig, ax = plt.subplots(figsize=(10, 4))
-                result.plot(kind='bar', x=result.columns[0], y=res_col, ax=ax, color='#00529B')
-                plt.xticks(rotation=45)
-                st.pyplot(fig)
-            else:
-                st.info("Single data point returned. Bar chart disabled.")
-        
-        with tab2:
             st.dataframe(result, use_container_width=True)
-            
-        with tab3:
-            st.info("The Architect used the following logic to solve this:")
+            if len(result) > 1:
+                fig, ax = plt.subplots(figsize=(10, 3))
+                result.plot(kind='bar', x=result.columns[0], y=metric_col, ax=ax, color='#00529B')
+                st.pyplot(fig)
+        with tab2:
             st.code(sql, language="sql")
-            
     else:
-        st.error(f"Architect Error: {result}")
+        st.error(f"Logic Error: {result}")
