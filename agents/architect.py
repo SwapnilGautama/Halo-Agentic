@@ -1,38 +1,45 @@
-import json
 import pandas as pd
 from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+import json
 
 class ArchitectAgent:
-    def __init__(
-        self,
-        kpi_directory_path="metadata/kpi_directory.xlsx",
-        prompt_path="prompts/architect_prompt.txt",
-        model="gpt-4o"
-    ):
+    def __init__(self, kpi_directory_path, prompt_path, model):
         self.kpi_df = pd.read_excel(kpi_directory_path)
-        self.prompt_template = open(prompt_path).read()
-        self.llm = ChatOpenAI(model=model, temperature=0)
+        self.model = ChatOpenAI(model=model, temperature=0)
 
-    def build_kpi_context(self):
-        # Reduce noise: only send what the LLM needs
-        cols = ["KPI_ID", "KPI_Name", "Business_Question", "KPI_Category"]
-        return self.kpi_df[cols].to_string(index=False)
-
-    def parse_response(self, response_text):
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            raise ValueError("Architect Agent returned invalid JSON")
+        with open(prompt_path, "r") as f:
+            self.prompt_template = f.read()
 
     def run(self, user_query: str):
-        prompt = self.prompt_template.replace(
-            "{{KPI_DIRECTORY}}",
-            self.build_kpi_context()
+        # ✅ IMPORTANT: Explicitly include KPI_Synonyms
+        kpi_context_df = self.kpi_df[[
+            "KPI_ID",
+            "KPI_Name",
+            "KPI_Synonyms",
+            "Business_Question",
+            "KPI_Category"
+        ]]
+
+        kpi_context = kpi_context_df.to_csv(index=False)
+
+        prompt = PromptTemplate(
+            input_variables=["KPI_DIRECTORY", "USER_QUESTION"],
+            template=self.prompt_template
         )
 
-        response = self.llm.invoke(
-            f"{prompt}\n\nUser: {user_query}\nOutput:"
+        final_prompt = prompt.format(
+            KPI_DIRECTORY=kpi_context,
+            USER_QUESTION=user_query
         )
 
-        return self.parse_response(response.content)
+        response = self.model.invoke(final_prompt)
 
+        try:
+            return json.loads(response.content)
+        except Exception:
+            return {
+                "kpi_id": None,
+                "filters": {},
+                "comparison": None
+            }
