@@ -2,117 +2,114 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import os
-import re
 import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (With Pre-Processing) ---
+# --- 1. DATA ENGINE (Load exact headers) ---
 @st.cache_resource
-def initialize_engine():
+def load_data():
     conn = duckdb.connect(database=':memory:')
-    # Load P&L
-    pnl = pd.read_excel("pnl_data.xlsx")
-    pnl['Month'] = pd.to_datetime(pnl['Month'])
-    # Ensure all column names are stripped of whitespace
-    pnl.columns = [c.strip() for c in pnl.columns]
-    conn.register("pnl_data", pnl)
     
-    # Load UT
-    ut = pd.read_excel("ut_data.xlsx")
-    ut['Date'] = pd.to_datetime(ut['Date'])
-    ut.columns = [c.strip() for c in ut.columns]
-    conn.register("ut_data", ut)
-    
-    # Load Directories as reference "Bibles"
-    field_dir = pd.read_excel("field_directory.xlsx").to_string()
-    kpi_dir = pd.read_excel("kpi_directory.xlsx").to_string()
-    return conn, field_dir, kpi_dir
+    if os.path.exists("pnl_data.xlsx"):
+        df_pnl = pd.read_excel("pnl_data.xlsx")
+        # Ensure date format and remove whitespace
+        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
+        conn.register("pnl_data", df_pnl)
 
-conn, FIELD_BIBLE, KPI_BIBLE = initialize_engine()
+    if os.path.exists("ut_data.xlsx"):
+        df_ut = pd.read_excel("ut_data.xlsx")
+        df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
+        conn.register("ut_data", df_ut)
 
-# --- 2. THE IMPROVED ANALYST PIPELINE ---
+    return conn
 
-def clean_sql_output(raw_text):
-    """Removes 'Certainly', 'To...', and markdown backticks."""
-    # Remove markdown blocks
-    clean = re.sub(r"```sql|```", "", raw_text).strip()
-    # Force start at the first SQL keyword
-    start_match = re.search(r"\b(WITH|SELECT)\b", clean, re.IGNORECASE)
-    if start_match:
-        clean = clean[start_match.start():]
-    return clean
+conn = load_data()
 
-def run_agent_v26(user_query):
+# --- 2. THE ANALYST ENGINE (v15.0) ---
+def execute_ai_query(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-    # AGENT 1: THE ARCHITECT (Logic & Field Selection)
-    architect_prompt = f"""
-    Use these Bibles:
-    FIELDS: {FIELD_BIBLE}
-    KPIs: {KPI_BIBLE}
+    # STEP 1: Intent Classification
+    intent_prompt = f"Classify the user input as 'DATA' or 'CHAT'. Input: {user_query}. Output only the word."
+    intent = llm.invoke(intent_prompt).content.strip().upper()
+
+    if 'CHAT' in intent:
+        chat_prompt = f"You are the L&T Executive Assistant. Briefly explain that you can calculate Revenue, Costs, C&B %, and Utilization across Segments and Customers. User: {user_query}"
+        return "CHAT", None, llm.invoke(chat_prompt).content
+
+    # STEP 2: DATA PATH (Precise Logic)
+    system_prompt = """
+    You are an expert SQL generator for DuckDB.
     
-    TASK: Identify logic for: "{user_query}"
+    TABLE SCHEMA:
+    - pnl_data: [Month, FinalCustomerName, "Amount in USD", Type, Group1, Group3, Segment]
+    - ut_data: [Date, FinalCustomerName, PSNo, TotalBillableHours, NetAvailableHours, Segment]
+
+    DATA VALUE MAPPING (STRICT):
+    - C&B Cost: SUM("Amount in USD") WHERE Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
+    - Revenue: SUM("Amount in USD") WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+    - Utilization %: (SUM(TotalBillableHours) / NULLIF(SUM(NetAvailableHours), 0)) * 100
+    - FTE / Headcount: COUNT(DISTINCT PSNo)
+
     RULES:
-    1. If query is about Industry/Vertical/Business Unit, you MUST use the column 'Segment'.
-    2. For Margin %, use logic: ((Revenue - Total_Cost) / Revenue) * 100.
-    """
-    logic_plan = llm.invoke(architect_prompt).content
+    1. If a query needs BOTH tables, join on FinalCustomerName AND Month (STRFTIME '%Y-%m').
+    2. Column Aliasing: Use descriptive names like CB_Cost, Revenue, Billable_Hours instead of generic 'Numerator'.
+    3. Always select columns in this order: [Dimension, Component_1, Component_2, Final_Result].
+    4. For dates like 'June 2025', use '2025-06-01'.
 
-    # AGENT 2: THE IMPROVED ANALYST (SQL Generation)
-    analyst_prompt = f"""
-    PLAN: {logic_plan}
+    Return ONLY the SQL block.
+    """
     
-    Write DuckDB SQL. RULES:
-    1. NO CONVERSATION. Start immediately with 'WITH' or 'SELECT'.
-    2. Do NOT say 'To' or 'Certainly'. 
-    3. Use 'Month' for pnl_data dates (format: '2025-06-01').
-    4. For Margin % < 30:
-       - CTE 1 (Rev): SUM Amount WHERE Type='Revenue' AND Group1 IN ('ONSITE','OFFSHORE','INDIRECT REVENUE')
-       - CTE 2 (Cost): SUM Amount WHERE Type='Cost'
-       - Final SELECT: Join on Segment or FinalCustomerName and filter WHERE Margin_Perc < 30.
-    """
-    sql_response = llm.invoke(analyst_prompt).content
-    final_sql = clean_sql_output(sql_response)
-
+    response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
+    sql = response.content.strip().replace("```sql", "").replace("```", "")
+    
     try:
-        df = conn.execute(final_sql).df()
-        return "SUCCESS", logic_plan, final_sql, df
+        df = conn.execute(sql).df()
+        return "DATA", sql, df
     except Exception as e:
-        return "ERROR", logic_plan, final_sql, str(e)
+        return "ERROR", sql, str(e)
 
-# --- 3. UI DASHBOARD ---
-st.set_page_config(layout="wide", page_title="L&T v26.0")
-st.title("🏛️ L&T Executive Analyst v26.0")
-st.caption("Improved Logic Isolation & Field Mapping")
+# --- 3. UI LAYOUT ---
+st.set_page_config(layout="wide")
+st.title("🏛️ L&T Executive Analyst v15.0")
 
-user_q = st.text_input("Ask a question (e.g., Segments with Margin % < 30 in Q2 2025):")
+user_input = st.text_input("Enter your query (e.g., 'C&B cost as % of revenue by segment for June 2025')")
 
-if user_q:
-    status, logic, sql, result = run_agent_v26(user_q)
+if user_input:
+    mode, sql, result = execute_ai_query(user_input)
     
-    if status == "SUCCESS":
-        st.subheader("📊 Results")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.dataframe(result, use_container_width=True)
-        with col2:
-            if not result.empty:
-                val_col = result.columns[-1]
-                fig, ax = plt.subplots(figsize=(8, 4))
-                result.plot(kind='barh', x=result.columns[0], y=val_col, ax=ax, color='#E63946')
-                st.pyplot(fig)
+    if mode == "CHAT":
+        st.write(result)
+        
+    elif mode == "DATA":
+        if isinstance(result, pd.DataFrame) and not result.empty:
+            # 2-Point Insights
+            avg_val = result.iloc[:, -1].mean()
+            max_val = result.iloc[:, -1].max()
+            st.info(f"💡 **Insights:** Period Average: **{avg_val:,.2f}** | Period Peak: **{max_val:,.2f}**")
 
-        # TABBED AUDIT LOG (As requested)
-        st.markdown("---")
-        with st.expander("🧾 Open Calculation Audit Log"):
-            t1, t2, t3 = st.tabs(["Formula Logic", "SQL Query", "Raw Components"])
-            with t1:
-                st.info(logic)
-            with t2:
+            tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
+            
+            with tab1:
+                # Show key result column (last one) and dimension (first one)
+                display_df = result.iloc[:, [0, -1]]
+                st.dataframe(display_df, use_container_width=True)
+                
+                if len(result) > 1:
+                    fig, ax = plt.subplots(figsize=(10, 4))
+                    ax.plot(result.iloc[:, 0].astype(str), result.iloc[:, -1], marker='o', color='#00529B', linewidth=2)
+                    plt.xticks(rotation=45)
+                    st.pyplot(fig)
+
+            with tab2:
+                st.markdown("### 🔍 Calculation Audit")
+                st.write("This table shows the exact components used for the calculation:")
+                st.dataframe(result, use_container_width=True)
+                st.write("**Generated SQL Query:**")
                 st.code(sql, language="sql")
-            with t3:
-                st.write("Numerator/Denominator Table:")
-                st.dataframe(result)
-    else:
+        else:
+            st.warning("No data found for this specific query. Please check filters like dates or names.")
+            
+    elif mode == "ERROR":
         st.error(f"Execution Error: {result}")
         st.code(sql)
