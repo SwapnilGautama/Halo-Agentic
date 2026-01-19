@@ -2,93 +2,78 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import os
-import matplotlib.pyplot as plt
 from langchain_openai import ChatOpenAI
 
-# --- 1. DATA ENGINE (v15 Base) ---
+# --- 1. DATA ENGINE (The Foundation) ---
 @st.cache_resource
 def load_data():
     conn = duckdb.connect(database=':memory:')
-    if os.path.exists("pnl_data.xlsx"):
-        df_pnl = pd.read_excel("pnl_data.xlsx")
-        df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
-        conn.register("pnl_data", df_pnl)
-    if os.path.exists("ut_data.xlsx"):
-        df_ut = pd.read_excel("ut_data.xlsx")
-        df_ut['Date'] = pd.to_datetime(df_ut['Date'], errors='coerce')
-        conn.register("ut_data", df_ut)
+    # Load files and clean column names to prevent mapping errors
+    for file, table in [("pnl_data.xlsx", "pnl_data"), ("ut_data.xlsx", "ut_data")]:
+        if os.path.exists(file):
+            df = pd.read_excel(file)
+            if 'Month' in df.columns: df['Month'] = pd.to_datetime(df['Month'])
+            if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date'])
+            conn.register(table, df)
     return conn
 
 conn = load_data()
 
-# --- 2. THE ANALYST ENGINE (v19.0 - v15 + CTE Logic) ---
-def execute_ai_query(user_query):
+# --- 2. THE SQL ARCHITECT (v20.0) ---
+def sql_architect(user_query):
     llm = ChatOpenAI(model="gpt-4o", temperature=0)
-
-    # 1. Intent Classification (Preserved from v15)
-    intent_prompt = f"Classify as 'DATA' or 'CHAT'. User: {user_query}. Output one word."
-    intent = llm.invoke(intent_prompt).content.strip().upper()
-
-    if 'CHAT' in intent:
-        return "CHAT", None, llm.invoke(f"Greet as L&T Assistant: {user_query}").content
-
-    # 2. SQL Path with CTE (Common Table Expression) Logic
-    system_prompt = """
-    You are a Financial SQL Generator for DuckDB. 
     
-    CTE LOGIC INSTRUCTIONS:
-    For any query calculating a percentage (Margin % or C&B %), use a WITH clause to create separate tables for the Numerator and Denominator.
+    # This prompt acts as the "Architect" ensuring Multi-Pass SQL
+    architect_prompt = """
+    You are a Senior SQL Architect. Your goal is to generate error-proof DuckDB SQL.
     
-    Example Structure:
-    WITH RevTable AS (SELECT Segment, SUM("Amount in USD") as Revenue FROM pnl_data WHERE Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE') GROUP BY 1),
-         CostTable AS (SELECT Segment, SUM("Amount in USD") as Total_Cost FROM pnl_data WHERE Type = 'Cost' GROUP BY 1)
-    SELECT r.Segment, r.Revenue, c.Total_Cost, ((r.Revenue - c.Total_Cost)/NULLIF(r.Revenue,0))*100 as Margin_Perc
-    FROM RevTable r LEFT JOIN CostTable c ON r.Segment = c.Segment;
-
-    MAPPING:
-    - C&B Cost: Use Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore')
-    - Revenue: Use Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+    CORE RULES FOR COMPLEX QUERIES:
+    1. For Ratios (Margin %, C&B %): You MUST use a CTE (WITH clause). 
+       - Pass 1: Aggregate Numerator (e.g., C&B_Cost)
+       - Pass 2: Aggregate Denominator (e.g., Revenue)
+       - Pass 3: Join them and calculate the %
     
-    OUTPUT: Always return 4 columns: [Dimension, Actual_Numerator_Name, Actual_Denominator_Name, Final_Result].
+    2. DATA MAPPING:
+       - Revenue: Group1 IN ('ONSITE', 'OFFSHORE', 'INDIRECT REVENUE')
+       - C&B Cost: Group3 IN ('C&B - Onsite Total', 'C&B Cost - Offshore') AND Type = 'Cost'
+       - Total Cost: Type = 'Cost'
+    
+    3. NAMING: Output 4 columns: [Dimension, Component_1_Name, Component_2_Name, Result_Percentage].
+    
+    4. DATE: June 2025 is '2025-06-01'.
     """
     
-    response = llm.invoke(system_prompt + f"\nUser Query: {user_query}")
-    sql = response.content.strip().replace("```sql", "").replace("```", "")
-    
     try:
+        response = llm.invoke(architect_prompt + f"\nUser Request: {user_query}")
+        sql = response.content.strip().replace("```sql", "").replace("```", "")
         df = conn.execute(sql).df()
-        return "DATA", sql, df
+        return "SUCCESS", sql, df
     except Exception as e:
-        return "ERROR", sql, str(e)
+        return "ERROR", None, str(e)
 
-# --- 3. UI (v15 Base) ---
-st.title("🏛️ L&T Executive Analyst v19.0")
-user_input = st.text_input("Ask about P&L or UT metrics (e.g. C&B % by Segment):")
+# --- 3. UI ---
+st.title("🏛️ L&T Analyst v20.0 (Multi-Agent Architect)")
+st.caption("Structured for Complex SQL & CTE execution")
 
-if user_input:
-    mode, sql, result = execute_ai_query(user_input)
+query = st.text_input("Enter your complex financial query:")
+
+if query:
+    status, sql, result = sql_architect(query)
     
-    if mode == "CHAT":
-        st.write(result)
-    elif mode == "DATA":
-        if not result.empty:
-            avg_val = result.iloc[:,-1].mean()
-            st.info(f"💡 **Executive Insight:** Average {result.columns[-1]} is **{avg_val:,.2f}**.")
-            
-            tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Calculation Details"])
-            with tab1:
-                st.dataframe(result.iloc[:, [0, -1]], use_container_width=True)
-                if len(result) > 1:
-                    fig, ax = plt.subplots(figsize=(10, 3))
-                    ax.bar(result.iloc[:, 0].astype(str), result.iloc[:, -1], color='#00529B')
-                    plt.xticks(rotation=45)
-                    st.pyplot(fig)
-            with tab2:
-                st.markdown("### 🔍 Calculation Audit")
-                st.write("**Fields used as components:**")
-                st.dataframe(result, use_container_width=True)
-                st.code(sql, language="sql")
-        else:
-            st.warning("No data found for this query.")
-    elif mode == "ERROR":
-        st.error(f"SQL Error: {result}")
+    if status == "SUCCESS":
+        st.success("Calculation Complete")
+        
+        # Insights & Breakdown
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Result (Avg)", f"{result.iloc[:,-1].mean():,.2f}%")
+        
+        tab1, tab2 = st.tabs(["📊 Dashboard", "🧾 Architect Logs"])
+        with tab1:
+            st.dataframe(result, use_container_width=True)
+        with tab2:
+            st.write("**Architect's SQL Strategy:**")
+            st.code(sql, language="sql")
+    else:
+        st.error(f"Architect encountered an error: {result}")
+        st.info("This usually happens if a field name is missing or the date format is unrecognized.")
