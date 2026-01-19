@@ -1,193 +1,125 @@
 import streamlit as st
-import duckdb
-import pandas as pd
 import os
-import json
-import hashlib
+import traceback
 
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
 from agents.bi import BIAgent
 from agents.validator import ValidationAgent
-from utils.logger import log_event
 import config
 
+
 # -------------------------------------------------
-# Streamlit Config
+# App setup
 # -------------------------------------------------
 st.set_page_config(
-    page_title="AI Analytics Engine",
+    page_title="Metadata-Driven AI Analytics Platform",
     layout="wide"
 )
 
 st.title("🤖 Metadata-Driven AI Analytics Platform")
-
-# -------------------------------------------------
-# Conversation Memory Helpers
-# -------------------------------------------------
-def get_last_intent():
-    return st.session_state.get("last_intent")
-
-
-def save_intent(intent):
-    st.session_state["last_intent"] = intent
-
-
-def merge_with_memory(new_intent, last_intent):
-    if not last_intent:
-        return new_intent
-
-    merged = {
-        "kpi_id": new_intent.get("kpi_id") or last_intent.get("kpi_id"),
-        "filters": last_intent.get("filters", {}).copy(),
-        "comparison": new_intent.get("comparison") or last_intent.get("comparison"),
-    }
-    merged["filters"].update(new_intent.get("filters", {}))
-    return merged
+st.subheader("Ask a business question")
 
 
 # -------------------------------------------------
-# DuckDB Loader
+# Resolve BASE DIRECTORY (CRITICAL FIX)
+# -------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+KPI_DIRECTORY_PATH = os.path.join(BASE_DIR, "metadata", "kpi_directory.xlsx")
+FIELD_DIRECTORY_PATH = os.path.join(BASE_DIR, "metadata", "field_directory.xlsx")
+ARCHITECT_PROMPT_PATH = os.path.join(BASE_DIR, "prompts", "architect_prompt.txt")
+
+
+# -------------------------------------------------
+# Initialize Agents (cached)
 # -------------------------------------------------
 @st.cache_resource
-def load_duckdb():
-    conn = duckdb.connect(database=":memory:")
+def load_agents():
+    architect = ArchitectAgent(
+        kpi_directory_path=KPI_DIRECTORY_PATH,
+        prompt_path=ARCHITECT_PROMPT_PATH,
+        model=config.MODEL_NAME
+    )
 
-    pnl_df = pd.read_excel(config.DATA_PATHS["PNL"])
-    pnl_df["Month"] = pd.to_datetime(pnl_df["Month"], errors="coerce")
-    conn.register("pnl_data", pnl_df)
+    analyst = AnalystAgent()
+    validator = ValidationAgent()
+    bi_agent = BIAgent()
 
-    ut_df = pd.read_excel(config.DATA_PATHS["UT"])
-    ut_df["Date"] = pd.to_datetime(ut_df["Date"], errors="coerce")
-    ut_df["Month"] = ut_df["Date"].dt.to_period("M").dt.to_timestamp()
-    conn.register("ut_data", ut_df)
-
-    return conn
+    return architect, analyst, validator, bi_agent
 
 
-conn = load_duckdb()
-
-# -------------------------------------------------
-# Cached SQL Execution
-# -------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=config.CACHE_TTL)
-def cached_query(sql):
-    return conn.execute(sql).df()
+architect, analyst, validator, bi_agent = load_agents()
 
 
 # -------------------------------------------------
-# Initialize Agents
+# User input
 # -------------------------------------------------
-architect = ArchitectAgent(
-    kpi_directory_path="metadata/kpi_directory.xlsx",
-    prompt_path="prompts/architect_prompt.txt",
-    model=config.MODEL_NAME
-)
-
-analyst = AnalystAgent()
-bi = BIAgent()
-validator = ValidationAgent()
-
-# -------------------------------------------------
-# Sidebar Context
-# -------------------------------------------------
-with st.sidebar:
-    st.markdown("### 🧠 Current Context")
-    if get_last_intent():
-        st.json(get_last_intent())
-    else:
-        st.write("No active context")
-
-# -------------------------------------------------
-# UI
-# -------------------------------------------------
-st.markdown("### Ask a business question")
 user_query = st.text_input(
-    "",
-    placeholder="e.g. Why did margin drop MoM for Transportation?"
+    label="",
+    placeholder="e.g. give me fte by segment for june 2025"
 )
 
+
+# -------------------------------------------------
+# Main execution
+# -------------------------------------------------
 if user_query:
     try:
-        # -----------------------------
-        # Architect Agent
-        # -----------------------------
-        raw_intent = architect.run(user_query)
-        intent = merge_with_memory(raw_intent, get_last_intent())
-        save_intent(intent)
+        # ---------------------------
+        # STEP 1: Architect Agent
+        # ---------------------------
+        architect_output = architect.run(user_query)
 
-        log_event("ARCHITECT_INTENT", intent)
-
-        if not intent.get("kpi_id"):
+        if not architect_output or not architect_output.get("kpi_id"):
             st.warning("Could not determine KPI.")
             st.stop()
 
-        # -----------------------------
-        # Analyst Agent
-        # -----------------------------
-        sql = analyst.generate_sql(
-            kpi_id=intent["kpi_id"],
-            filters=intent.get("filters", {}),
-            comparison=intent.get("comparison")
+        # ---------------------------
+        # STEP 2: Analyst Agent
+        # ---------------------------
+        analysis_output = analyst.run(architect_output)
+
+        # ---------------------------
+        # STEP 3: Validator Agent
+        # ---------------------------
+        validation_result = validator.run(
+            analysis_output,
+            architect_output
         )
 
-        log_event("SQL_GENERATED", {"kpi": intent["kpi_id"], "sql": sql})
-
-        # -----------------------------
-        # Execute SQL
-        # -----------------------------
-        df = cached_query(sql)
-
-        if df.empty:
-            st.warning("No data returned.")
+        if not validation_result.get("is_valid", True):
+            st.error("Validation failed.")
+            st.json(validation_result)
             st.stop()
 
-        # -----------------------------
-        # Validation
-        # -----------------------------
-        warnings, errors = validator.validate(
-            intent["kpi_id"],
-            df,
-            intent.get("comparison")
+        # ---------------------------
+        # STEP 4: BI Agent
+        # ---------------------------
+        bi_output = bi_agent.run(
+            analysis_output,
+            architect_output
         )
 
-        log_event("VALIDATION", {"warnings": warnings, "errors": errors})
+        # ---------------------------
+        # Render Outputs
+        # ---------------------------
+        if "table" in bi_output:
+            st.subheader("📊 Result Table")
+            st.dataframe(bi_output["table"])
 
-        if errors:
-            st.error("❌ Data validation failed")
-            for e in errors:
-                st.error(e)
-            st.stop()
+        if "chart" in bi_output:
+            st.subheader("📈 Chart")
+            st.pyplot(bi_output["chart"])
 
-        for w in warnings:
-            st.warning(w)
-
-        # -----------------------------
-        # Row Safety
-        # -----------------------------
-        if config.MAX_ROWS and len(df) > config.MAX_ROWS:
-            st.warning(
-                f"Result truncated to first {config.MAX_ROWS} rows for display."
-            )
-            df = df.head(config.MAX_ROWS)
-
-        # -----------------------------
-        # BI Agent
-        # -----------------------------
-        bi.render(
-            kpi_id=intent["kpi_id"],
-            df=df,
-            comparison=intent.get("comparison")
-        )
-
-        # -----------------------------
-        # Audit
-        # -----------------------------
-        with st.expander("🔍 SQL & Data Audit"):
-            st.code(sql, language="sql")
-            st.dataframe(df, use_container_width=True)
+        if "insights" in bi_output:
+            st.subheader("🧠 Insights")
+            st.write(bi_output["insights"])
 
     except Exception as e:
-        log_event("UNHANDLED_ERROR", str(e))
-        st.error("⚠️ Something went wrong while processing your request.")
+        st.error("Something went wrong while processing your request.")
         st.info("The issue has been logged. Please try rephrasing.")
+
+        # FULL DEBUG TRACE (visible in Streamlit logs)
+        print("❌ APP ERROR")
+        print(traceback.format_exc())
