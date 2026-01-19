@@ -87,7 +87,7 @@ if user_query:
     with st.spinner("Thinking..."):
 
         # Step 1: Architect
-        architecture = architect.route(user_query)
+        architecture = architect.run(user_query)
 
         if not architecture:
             st.warning("❌ Could not determine KPI.")
@@ -121,3 +121,4 @@ if user_query:
     if "chart" in final_output:
         st.markdown("### 📈 Chart")
         st.plotly_chart(final_output["chart"], use_container_width=True)
+
