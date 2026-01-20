@@ -1,100 +1,130 @@
 import streamlit as st
 import json
-import pandas as pd
 
+# ----------------------------
+# Agent Imports
+# ----------------------------
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
-from agents.validator import ValidationAgent
+from agents.validator import ValidatorAgent
 from agents.bi import BIAgent
 
-from config import MODEL_NAME
-
-# ----------------------------------
-# Streamlit Page Config
-# ----------------------------------
+# ----------------------------
+# App Config
+# ----------------------------
 st.set_page_config(
     page_title="Metadata-Driven AI Analytics Platform",
     layout="wide"
 )
 
 st.title("🤖 Metadata-Driven AI Analytics Platform")
-
-# ----------------------------------
-# Initialize Agents (CORRECTLY)
-# ----------------------------------
-architect = ArchitectAgent(
-    kpi_directory_path="metadata/kpi_directory.xlsx",
-    prompt_path="prompts/architect_prompt.txt",
-    model=MODEL_NAME
-)
-
-analyst = AnalystAgent()
-validator = ValidationAgent()
-bi_agent = BIAgent()
-
-# ----------------------------------
-# UI Input
-# ----------------------------------
 st.subheader("Ask a business question")
 
+# ----------------------------
+# Initialize Agents (ONCE)
+# ----------------------------
+@st.cache_resource
+def load_agents():
+    return {
+        "architect": ArchitectAgent(),
+        "analyst": AnalystAgent(),
+        "validator": ValidatorAgent(),
+        "bi": BIAgent()
+    }
+
+agents = load_agents()
+architect = agents["architect"]
+analyst = agents["analyst"]
+validator = agents["validator"]
+bi = agents["bi"]
+
+# ----------------------------
+# User Input
+# ----------------------------
 user_query = st.text_input(
-    label="Business Question",
-    placeholder="e.g. give me fte by segment for june 2025",
-    label_visibility="collapsed"
+    label="",
+    placeholder="e.g. give me FTE by segment for June 2025"
 )
 
-# ----------------------------------
-# Main Execution
-# ----------------------------------
-if user_query:
+if not user_query:
+    st.stop()
 
-    with st.spinner("Thinking..."):
+st.markdown("⏳ **Thinking...**")
 
-        # -------------------------------
-        # Step 1: Architect
-        # -------------------------------
-        raw_response = architect.run(user_query)
+# ----------------------------
+# STEP 1: ARCHITECT
+# ----------------------------
+raw_response = architect.run(user_query)
 
-        # Defensive: strip markdown fences
-        if isinstance(raw_response, str):
-            raw_response = raw_response.strip()
-            if raw_response.startswith("```"):
-                raw_response = raw_response.replace("```json", "").replace("```", "").strip()
+# ---- FIX: Handle dict vs JSON string ----
+if isinstance(raw_response, dict):
+    architecture = raw_response
 
-        try:
-            architecture = json.loads(raw_response)
-        except Exception as e:
-            st.error("❌ Architect returned invalid JSON")
-            st.code(raw_response)
-            st.stop()
+elif isinstance(raw_response, str):
+    cleaned = raw_response.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    try:
+        architecture = json.loads(cleaned)
+    except Exception:
+        st.error("❌ Architect returned invalid JSON")
+        st.code(cleaned)
+        st.stop()
 
-        if not architecture or architecture.get("kpi_id") is None:
-            st.warning("❌ Could not determine KPI.")
-            st.stop()
+else:
+    st.error("❌ Architect returned unsupported response type")
+    st.write(type(raw_response))
+    st.stop()
 
-        # -------------------------------
-        # Step 2: Validation
-        # -------------------------------
-        validation = validator.validate(
-            architecture=architecture,
-            df=None  # placeholder until BI layer loads real data
-        )
+# Debug (safe to remove later)
+st.code(architecture, language="json")
 
-        if not validation["is_valid"]:
-            st.error(validation["reason"])
-            st.stop()
+# ----------------------------
+# STEP 2: BASIC ARCHITECT VALIDATION
+# ----------------------------
+if not isinstance(architecture, dict):
+    st.error("❌ Architecture is not a dictionary")
+    st.stop()
 
-        # -------------------------------
-        # Step 3: BI Execution
-        # -------------------------------
-        result = bi_agent.execute(architecture)
+if architecture.get("kpi_id") is None:
+    st.warning("❌ Could not determine KPI.")
+    st.stop()
 
-        # -------------------------------
-        # Step 4: Display
-        # -------------------------------
-        st.success("✅ Analysis Complete")
+# ----------------------------
+# STEP 3: VALIDATOR
+# ----------------------------
+validation = validator.validate(architecture)
 
-        if isinstance(result, pd.DataFrame):
-            st.dataframe(result)
-        else:
-            st.write(result)
+if not validation.get("valid", False):
+    st.error("❌ Validation failed")
+    st.write(validation)
+    st.stop()
+
+# ----------------------------
+# STEP 4: ANALYST
+# ----------------------------
+analysis_plan = analyst.build_analysis_plan(architecture)
+
+if not analysis_plan:
+    st.error("❌ Analyst could not build analysis plan")
+    st.stop()
+
+# ----------------------------
+# STEP 5: BI EXECUTION
+# ----------------------------
+result = bi.execute(analysis_plan)
+
+# ----------------------------
+# STEP 6: DISPLAY OUTPUT
+# ----------------------------
+st.success("✅ Analysis complete")
+
+if isinstance(result, dict):
+    if "table" in result:
+        st.dataframe(result["table"])
+
+    if "summary" in result:
+        st.markdown("### 📊 Summary")
+        st.write(result["summary"])
+else:
+    st.write(result)
