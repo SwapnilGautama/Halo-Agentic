@@ -19,18 +19,17 @@ user_query = st.text_input("")
 
 
 # -----------------------------
-# Initialize Agents (ONCE)
+# Initialize Agents (NO CACHE)
 # -----------------------------
-@st.cache_resource
-def load_agents():
-    return {
-        "architect": ArchitectAgent(),
-        "analyst": AnalystAgent(),
-        "bi": BIAgent(),
-        "validator": ValidationAgent()
-    }
-
-agents = load_agents()
+try:
+    architect = ArchitectAgent()
+    analyst = AnalystAgent()
+    validator = ValidationAgent()
+    bi = BIAgent()
+except TypeError as e:
+    st.error("❌ Agent initialization failed")
+    st.exception(e)
+    st.stop()
 
 
 # -----------------------------
@@ -41,9 +40,9 @@ if user_query:
     with st.spinner("Thinking..."):
 
         # ---- STEP 1: ARCHITECT ----
-        architecture = agents["architect"].route(user_query)
+        architecture = architect.route(user_query)
 
-        # Ensure architecture is a dict (JSON safety)
+        # JSON safety
         if isinstance(architecture, str):
             try:
                 architecture = json.loads(architecture)
@@ -59,7 +58,7 @@ if user_query:
 
         # ---- STEP 2: ANALYST ----
         try:
-            df = agents["analyst"].run(
+            df = analyst.run(
                 kpi_id=architecture["kpi_id"],
                 filters=architecture.get("filters", {}),
                 comparison=architecture.get("comparison")
@@ -70,7 +69,7 @@ if user_query:
             st.stop()
 
         # ---- STEP 3: VALIDATOR ----
-        warnings, errors = agents["validator"].validate(
+        warnings, errors = validator.validate(
             kpi_id=architecture["kpi_id"],
             df=df,
             comparison=architecture.get("comparison")
@@ -86,7 +85,7 @@ if user_query:
             st.json(warnings)
 
         # ---- STEP 4: BI AGENT ----
-        output = agents["bi"].render(
+        output = bi.render(
             df=df,
             kpi_id=architecture["kpi_id"]
         )
