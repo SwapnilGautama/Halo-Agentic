@@ -5,13 +5,13 @@ from config import PNL_DATA_PATH, UT_DATA_PATH
 
 class AnalystAgent:
     def __init__(self):
-        # Create a persistent connection
+        # Persistent memory connection
         self.conn = duckdb.connect(database=':memory:')
         self.last_sql = ""
-        self._load_data()
+        self._load_data_once()
 
-    def _load_data(self):
-        # Only runs ONCE when the app starts
+    def _load_data_once(self):
+        # Loads files into memory only at the very start of the app
         if os.path.exists(PNL_DATA_PATH):
             df_pnl = pd.read_excel(PNL_DATA_PATH)
             df_pnl['Month'] = pd.to_datetime(df_pnl['Month'], errors='coerce')
@@ -28,10 +28,10 @@ class AnalystAgent:
         month_val = filters.get("Month")
         date_clause = f"Month = '{month_val}'" if month_val else "1=1"
         
-        # Safe Dimension Selection
+        # Dimension logic
         dim = "FinalCustomerName" if "Customer" in str(architecture) else "Segment"
 
-        # Margin % (Bucket Join Logic)
+        # Specialized Margin Logic
         if kpi_id == "KPI_006":
             sql = f"""
             WITH Rev AS (
