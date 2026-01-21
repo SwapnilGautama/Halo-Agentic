@@ -1,60 +1,51 @@
 import streamlit as st
-
+import traceback
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
-from agents.validator import ValidationAgent
+from agents.bi import BIAgent
+from config import KPI_DIRECTORY_PATH, ARCHITECT_PROMPT_PATH, MODEL_NAME
 
-from config import (
-    KPI_DIRECTORY_PATH,
-    ARCHITECT_PROMPT_PATH,
-    MODEL_NAME
-)
-
-st.set_page_config(page_title="Metadata-Driven AI Analytics Platform", layout="wide")
-st.title("🤖 Metadata-Driven AI Analytics Platform")
-st.subheader("Ask a business question")
+st.set_page_config(page_title="L&T AI Analyst", layout="wide")
+st.title("🤖 L&T Executive AI Analyst")
 
 @st.cache_resource
-def load_agents():
+def startup_system():
+    # Load everything into memory ONCE
     return {
-        "architect": ArchitectAgent(
-            KPI_DIRECTORY_PATH,
-            ARCHITECT_PROMPT_PATH,
-            MODEL_NAME
-        ),
+        "architect": ArchitectAgent(KPI_DIRECTORY_PATH, ARCHITECT_PROMPT_PATH, MODEL_NAME),
         "analyst": AnalystAgent(),
-        "validator": ValidationAgent(KPI_DIRECTORY_PATH)
+        "bi": BIAgent(KPI_DIRECTORY_PATH)
     }
 
-agents = load_agents()
+system = startup_system()
 
-architect = agents["architect"]
-analyst = agents["analyst"]
-validator = agents["validator"]
-
-user_query = st.text_input("")
+user_query = st.text_input("Analyze business data:", placeholder="e.g. What is the Margin % for June 2025?")
 
 if user_query:
-    with st.spinner("Thinking..."):
-        architecture = architect.run(user_query)
+    try:
+        with st.spinner("Processing Request..."):
+            # 1. Map Intent
+            arch_out = system["architect"].run(user_query)
+            
+            if not arch_out.get("kpi_id"):
+                st.warning("KPI not identified. Please try 'Revenue' or 'Margin'.")
+                st.stop()
 
-        st.write("### 🧠 Architecture Output")
-        st.json(architecture)
+            # 2. Run Data Engine
+            data = system["analyst"].run(arch_out)
 
-        if architecture["kpi_id"] is None:
-            st.warning("⚠️ Could not determine KPI")
-            st.stop()
+            # 3. Display Results
+            if not data.empty:
+                tab_dash, tab_audit = st.tabs(["📊 Dashboard", "🔍 Technical Audit"])
+                with tab_dash:
+                    system["bi"].render(arch_out["kpi_id"], data)
+                with tab_audit:
+                    st.markdown("### SQL Logic Used")
+                    st.code(system["analyst"].last_sql, language="sql")
+                    st.dataframe(data)
+            else:
+                st.error("No data found for the selected period.")
 
-        df = analyst.run(architecture)
-
-        warnings, errors = validator.validate(
-            architecture["kpi_id"],
-            df,
-            architecture.get("comparison")
-        )
-
-        if errors:
-            st.error(errors)
-        else:
-            st.success("✅ Result")
-            st.dataframe(df)
+    except Exception:
+        st.error("System Error encountered.")
+        st.expander("Details").code(traceback.format_exc())
