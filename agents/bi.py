@@ -8,8 +8,7 @@ class BIAgent:
 
     def get_kpi_meta(self, kpi_id):
         row = self.kpi_df[self.kpi_df["KPI_ID"] == kpi_id]
-        if row.empty: return None
-        return row.iloc[0]
+        return row.iloc[0] if not row.empty else None
 
     def format_value(self, val, unit):
         try:
@@ -22,22 +21,25 @@ class BIAgent:
             return str(val)
 
     def render(self, kpi_id, df, comparison=None):
-        if "Error" in df.columns:
-            st.error(f"SQL Error: {df['Error'].iloc[0]}")
+        meta = self.get_kpi_meta(kpi_id)
+        if meta is None or df.empty:
+            st.warning("No displayable data found.")
             return
 
-        kpi_meta = self.get_kpi_meta(kpi_id)
-        if kpi_meta is None:
-            st.error(f"KPI {kpi_id} metadata missing.")
-            return
-
-        st.metric(label=f"Avg {kpi_meta['KPI_Name']}", value=self.format_value(df["value"].mean(), kpi_meta["Unit"]))
+        st.markdown(f"### 📈 {meta['KPI_Name']} Analysis")
         
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            fig, ax = plt.subplots()
-            ax.bar(df.iloc[:, 0].astype(str), df["value"], color='#00529B')
-            plt.xticks(rotation=45)
+        # Metric Card
+        avg_val = df["value"].mean()
+        st.metric(label=f"Avg {meta['KPI_Name']}", value=self.format_value(avg_val, meta["Unit"]))
+
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.bar(df.iloc[:, 0].astype(str), df["value"], color="#00529B")
+            plt.xticks(rotation=45, ha='right')
             st.pyplot(fig)
-        with c2:
-            st.dataframe(df)
+        
+        with col2:
+            display_df = df.copy()
+            display_df["value"] = display_df["value"].apply(lambda x: self.format_value(x, meta["Unit"]))
+            st.dataframe(display_df, use_container_width=True)
