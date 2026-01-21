@@ -1,6 +1,12 @@
 import streamlit as st
 import json
 
+from config import (
+    KPI_DIRECTORY_PATH,
+    ARCHITECT_PROMPT_PATH,
+    MODEL_NAME
+)
+
 from agents.architect import ArchitectAgent
 from agents.analyst import AnalystAgent
 from agents.bi import BIAgent
@@ -8,9 +14,12 @@ from agents.validator import ValidationAgent
 
 
 # -----------------------------
-# App Setup
+# Streamlit Setup
 # -----------------------------
-st.set_page_config(page_title="Metadata-Driven AI Analytics Platform", layout="wide")
+st.set_page_config(
+    page_title="Metadata-Driven AI Analytics Platform",
+    layout="wide"
+)
 
 st.title("🤖 Metadata-Driven AI Analytics Platform")
 st.subheader("Ask a business question")
@@ -22,11 +31,17 @@ user_query = st.text_input("")
 # Initialize Agents (NO CACHE)
 # -----------------------------
 try:
-    architect = ArchitectAgent()
+    architect = ArchitectAgent(
+        kpi_directory_path=KPI_DIRECTORY_PATH,
+        prompt_path=ARCHITECT_PROMPT_PATH,
+        model=MODEL_NAME
+    )
+
     analyst = AnalystAgent()
     validator = ValidationAgent()
     bi = BIAgent()
-except TypeError as e:
+
+except Exception as e:
     st.error("❌ Agent initialization failed")
     st.exception(e)
     st.stop()
@@ -68,7 +83,7 @@ if user_query:
             st.exception(e)
             st.stop()
 
-        # ---- STEP 3: VALIDATOR ----
+        # ---- STEP 3: VALIDATION ----
         warnings, errors = validator.validate(
             kpi_id=architecture["kpi_id"],
             df=df,
